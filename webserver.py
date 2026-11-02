@@ -3,17 +3,16 @@ import json
 from time import sleep
 import queue
 import threading
-import traceback
 from datetime import datetime
 from main import check_pmdb_token, sync_lists, sync_resume_points, sync_movie_watch_history, sync_show_watch_history, sync_dropped_shows, sync_watchlist, build_sync_context, version
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Cookie, Response, status, Request
+from fastapi import FastAPI, Header, HTTPException, Response, status, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
-import base64
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from uuid import uuid4
-from cryptography.fernet import Fernet
+from auth_sessions import SessionStore, SESSION_TTL_SECONDS
+from urllib.parse import urlsplit
 from contextlib import asynccontextmanager
 import asyncio
 import gc
@@ -21,9 +20,17 @@ import ctypes
 
 # Define SIGTERM handler
 shutdown_requested = threading.Event()
+sessions = SessionStore()
+
+async def purge_expired_sessions():
+    while True:
+        await asyncio.sleep(60)
+        sessions.purge()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    shutdown_requested.clear()
+    cleanup_task = asyncio.create_task(purge_expired_sessions())
     yield
     shutdown_requested.set()
     print("Shutdown signal received, waiting for running jobs to complete...")
@@ -36,9 +43,48 @@ async def lifespan(app: FastAPI):
             break
         print(f"Shutdown waiting for {remaining} running migration job(s)...")
         await asyncio.sleep(5)  # Wait before checking again
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    sessions.clear()
 
 app = FastAPI(lifespan=lifespan)
 load_dotenv()
+public_origin = os.getenv("domain", "http://127.0.0.1:8000").rstrip("/")
+secure_cookies = urlsplit(public_origin).scheme == "https"
+session_cookie_name = "__Host-pmdb_session" if secure_cookies else "pmdb_session"
+
+@app.middleware("http")
+async def protect_browser_requests(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("origin")
+        fetch_site = request.headers.get("sec-fetch-site")
+        if (request.headers.get("x-requested-with") != "TraktMigration"
+                or (origin is not None and origin != public_origin)
+                or fetch_site not in {None, "same-origin", "none"}):
+            response = JSONResponse({"detail": "Same-origin request required"}, status_code=403)
+        else:
+            response = await call_next(request)
+    else:
+        response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; img-src 'self' data:; worker-src 'self' blob:; "
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    )
+    return response
+
+def session_key(request: Request):
+    return sessions.get(request.cookies.get(session_cookie_name))
+
+def delete_auth_cookies(response: Response):
+    response.delete_cookie("pmdb_auth", path="/", secure=secure_cookies, httponly=True, samesite="strict")
+    response.delete_cookie(session_cookie_name, path="/", secure=secure_cookies, httponly=True, samesite="strict")
 running_jobs = []  # List to keep track of running jobs and their event queues
 jobs_lock = threading.Lock()  # Lock to synchronize access to the running_jobs list
 server_start_time = datetime.now()
@@ -62,12 +108,13 @@ def release_job_memory(sync_context) -> None:
     """Drop large job-owned objects and return free arenas to libc when supported."""
     sync_context.trakt_data = None
     sync_context.pmdb_headers = None
+    sync_context.trakt_headers = None
     sync_context.event_queue = None
     sync_context.trakt_profile = None
     gc.collect()
     try:
         ctypes.CDLL(None).malloc_trim(0)
-    except (AttributeError, OSError):
+    except (AttributeError, OSError, TypeError):
         pass
 
 def get_running_job(job_id: str) -> dict | None:
@@ -150,28 +197,6 @@ class server_status(BaseModel):
         }
     }
 
-def decode_cookie(cookie_value: str) -> dict | None:
-    try:
-        encryption_key = os.getenv("cookie_encryption_key")
-
-        decoded = base64.b64decode(cookie_value).decode()
-        decrypted = Fernet(encryption_key).decrypt(decoded.encode()).decode()
-        return json.loads(base64.urlsafe_b64decode(decrypted).decode())
-    except Exception as e:
-        print(f"Error decoding cookie: {e}")
-        return None
-    
-def encode_cookie(data: dict) -> str | None:
-    try:
-        encryption_key = os.getenv("cookie_encryption_key")
-
-        encoded = base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
-        encrypted = Fernet(encryption_key).encrypt(encoded.encode()).decode()
-        return base64.b64encode(encrypted.encode()).decode()
-    except Exception as e:
-        print(f"Error encoding cookie: {e}")
-        return None
-
 @app.get("/status")
 def get_server_status() -> server_status:
     global trakt_api_url, userAgent
@@ -188,54 +213,38 @@ def get_server_status() -> server_status:
     return status_return
     
 @app.post("/pmdb/auth")
-def authenticate_pmdb_user(response: Response, Authorization: str = Header(default=None)) -> dict:
-    if not Authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    api_key = Authorization.split(" ")[-1]  # Extract the API key from the header
-    if not api_key:
-        raise HTTPException(status_code=401, detail="Missing API key")
-    
-    success = check_pmdb_token(api_key)
-    if not success:
-        raise HTTPException(status_code=401, detail="Invalid PMDB API key")
-
-    pmdb_auth = {
-        "api_key": api_key
-    }
-    cookie = encode_cookie(pmdb_auth)
-
-    response.set_cookie(key="pmdb_auth", value=cookie, httponly=True, max_age=30*24*3600, samesite="strict", secure=False if os.getenv("domain", "http://127.0.0.1:8000").startswith("http://") else True)  # Set PMDB auth cookie for 30 days
+def authenticate_pmdb_user(request: Request, response: Response, Authorization: str = Header(default=None)) -> dict:
+    scheme, _, api_key = (Authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not api_key or len(api_key) > 4096:
+        raise HTTPException(status_code=401, detail="Missing or invalid API key")
+    if not check_pmdb_token(api_key):
+        raise HTTPException(status_code=401, detail="Invalid PMDB API key or PMDB unavailable")
+    sessions.revoke(request.cookies.get(session_cookie_name))
+    try:
+        token = sessions.create(api_key)
+    except OverflowError:
+        raise HTTPException(status_code=503, detail="Too many active sessions; try again later") from None
+    delete_auth_cookies(response)
+    response.set_cookie(key=session_cookie_name, value=token, httponly=True,
+                        max_age=SESSION_TTL_SECONDS, samesite="strict", secure=secure_cookies, path="/")
     return {"success": True, "message": "PMDB authentication successful"}
 
+
 @app.get("/auth/status")
-def get_authentication_status(response: Response, pmdb_auth: str | None = Cookie(default=None)) -> dict:
+def get_authentication_status(request: Request, response: Response) -> dict:
+    logged_in = session_key(request) is not None
+    # Old encrypted credential cookies are deliberately never decoded or accepted.
+    if "pmdb_auth" in request.cookies:
+        response.delete_cookie("pmdb_auth", path="/", secure=secure_cookies, httponly=True, samesite="strict")
+    return {"pmdb": logged_in}
 
-    pmdb_logged_in = pmdb_auth is not None
 
-    # Decode the auth cookies from base64
-    if pmdb_auth:
-        pmdb_auth = decode_cookie(pmdb_auth)
-        if not pmdb_auth:
-            print("Failed to decode pmdb_auth cookie")
-            pmdb_logged_in = False
-        else:
-            pmdb_auth = pmdb_auth.get("api_key", "")
+@app.post("/pmdb/logout")
+def logout_pmdb(request: Request, response: Response) -> dict:
+    sessions.revoke(request.cookies.get(session_cookie_name))
+    delete_auth_cookies(response)
+    return {"success": True}
 
-    if pmdb_logged_in:
-        pmdb_logged_in = check_pmdb_token(pmdb_auth)
-
-    pmdb_user = None
-
-    if pmdb_logged_in and pmdb_auth:
-        pmdb_user = pmdb_auth[:15] + "..."  # Show only the first 15 characters of the PMDB API key for privacy
-    else:
-        response.delete_cookie(key="pmdb_auth")
-
-    return {
-        "pmdb": pmdb_logged_in,
-        "pmdb_user": pmdb_user
-    }
 
 def migrate_data(sync_context: dict, sync_options: dict, event_queue: queue.Queue, job_id: str) -> None:
     try:
@@ -272,10 +281,10 @@ def migrate_data(sync_context: dict, sync_options: dict, event_queue: queue.Queu
         sync_context.trakt_data.pop("watched-playback", None)
 
         enqueue_event(event_queue, {"type": "complete", "message": "Migration complete", "step": 7, "progress": 100})
-    except Exception as e:
-        print(f"Error during migration: {e}")
-        traceback.print_exc()
-        enqueue_event(event_queue, {"type": "critical", "message": f"Migration failed: {str(e)}"})
+    except Exception:
+        # Exception text and tracebacks may contain upstream credentials or request data.
+        print("Migration failed; sensitive exception details suppressed.")
+        enqueue_event(event_queue, {"type": "critical", "message": "Migration failed. Check PMDB availability and your export, then retry."})
     finally:
         remove_job(job_id)
         release_job_memory(sync_context)
@@ -305,28 +314,25 @@ def create_sync_job_dummy() -> tuple[str, queue.Queue, threading.Thread]:
     return job_id, event_queue, thread
 
 @app.post("/migrate")
-def request_data_migration(sync_options: sync_options, response: Response, pmdb_auth: str | None = Cookie(default=None)) -> dict:
+def request_data_migration(sync_options: sync_options, response: Response, request: Request) -> dict:
     if shutdown_requested.is_set():
         raise HTTPException(status_code=503, detail="Server is shutting down; new migrations are disabled")
 
-    if not pmdb_auth:
+    pmdb_api_key = session_key(request)
+    if not pmdb_api_key:
         raise HTTPException(status_code=401, detail="Not authenticated with PMDB")
 
     trakt_auth = sync_options.trakt_data.get("user-profile", None)
     if not trakt_auth:
         raise HTTPException(status_code=401, detail="Not authenticated with Trakt or missing Trakt user profile data")
     
-    pmdb_auth = decode_cookie(pmdb_auth)
-    pmdb_api_key = pmdb_auth.get("api_key", "") if pmdb_auth else None
-    if not pmdb_api_key:
-        print("Failed to decode pmdb_auth cookie")
-        raise HTTPException(status_code=400, detail="Invalid PMDB authentication cookie")
-
     existing_jobs = search_running_jobs(pmdb_api_key)
     if existing_jobs:
         response.status_code = status.HTTP_409_CONFLICT
         return {"success": True, "job_id": existing_jobs[0].get("job_id"), "events_url": f"/migrate/{existing_jobs[0].get('job_id')}/events", "message": "A migration job is already running for this PMDB account. Please wait for it to complete before starting a new one."}
     
+    sync_context = None
+    job_id = None
     try:
         event_queue = create_event_queue()  # Create a bounded event queue for this job
         sync_context = build_sync_context(pmdb_api_key, event_queue, sync_options.trakt_data)  # Build the sync context with the provided options and event queue
@@ -339,9 +345,12 @@ def request_data_migration(sync_options: sync_options, response: Response, pmdb_
         thread.start()
 
         return {"success": True, "job_id": job_id, "events_url": f"/migrate/{job_id}/events", "message": "Migration job started successfully"}
-    except Exception as e:
-        print(f"Error starting migration job: {e}")
-        traceback.print_exc()
+    except Exception:
+        print("Error starting migration job; sensitive exception details suppressed.")
+        if job_id is not None:
+            remove_job(job_id)
+        if sync_context is not None:
+            release_job_memory(sync_context)
         raise HTTPException(status_code=500, detail="Failed to start migration job")
 
 def stream_sync_job(job_id: str, pmdb_api_key: str, request: Request) -> StreamingResponse:
@@ -374,17 +383,10 @@ def stream_sync_job(job_id: str, pmdb_api_key: str, request: Request) -> Streami
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/migrate/{job_id}/events")
-def migrate_job_events(job_id: str, request: Request, pmdb_auth: str | None = Cookie(default=None)) -> StreamingResponse:
-    pmdb_api_key = None
-
-    if pmdb_auth:
-        pmdb_auth = decode_cookie(pmdb_auth) if pmdb_auth else None
-        pmdb_api_key = pmdb_auth.get("api_key", "") if pmdb_auth else None
-        if not pmdb_api_key:
-            raise HTTPException(status_code=400, detail="Invalid PMDB authentication cookie")
-    else:
+def migrate_job_events(job_id: str, request: Request) -> StreamingResponse:
+    pmdb_api_key = session_key(request)
+    if not pmdb_api_key:
         raise HTTPException(status_code=401, detail="Not authenticated with PMDB")
-    
     return stream_sync_job(job_id, pmdb_api_key, request)
 
 # This mounts the "static" directory to serve static files (like the callback HTML page) at the root URL.

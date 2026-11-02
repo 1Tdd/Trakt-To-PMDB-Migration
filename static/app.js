@@ -1,0 +1,757 @@
+const traktFileStatus = document.querySelector(".trakt-file-status");
+const TRAKT_DB_NAME = "trakt-migration";
+const TRAKT_DB_VERSION = 1;
+const TRAKT_STORE_NAME = "client-state";
+const TRAKT_DATA_KEY = "trakt_data";
+
+function openDatabase(name, version, storeName) {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(name, version);
+        request.onupgradeneeded = () => {
+            const db = request.result;
+            if (!db.objectStoreNames.contains(storeName)) {
+                db.createObjectStore(storeName);
+            }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function setDatabase(data, name, version, storeName, key) {
+    const db = await openDatabase(name, version, storeName);
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(storeName, "readwrite");
+        const store = transaction.objectStore(storeName);
+        const request = store.put(data, key);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => db.close();
+        transaction.onerror = () => db.close();
+        transaction.onabort = () => db.close();
+    });
+}
+
+async function getDatabase(name, version, storeName, key) {
+    const db = await openDatabase(name, version, storeName);
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(storeName, "readonly");
+        const store = transaction.objectStore(storeName);
+        const request = store.get(key);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => db.close();
+        transaction.onerror = () => db.close();
+        transaction.onabort = () => db.close();
+    });
+}
+
+async function clearDatabase(name, version, storeName, key) {
+    const db = await openDatabase(name, version, storeName);
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(storeName, "readwrite");
+        const store = transaction.objectStore(storeName);
+        const request = store.delete(key);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => db.close();
+        transaction.onerror = () => db.close();
+        transaction.onabort = () => db.close();
+    });
+}
+
+async function traktDataHandler() {
+    let collectedData;
+    try {
+        collectedData = await getDatabase(TRAKT_DB_NAME, TRAKT_DB_VERSION, TRAKT_STORE_NAME, TRAKT_DATA_KEY);
+    } catch (error) {
+        console.error("Error parsing collected Trakt data:", error);
+        localStorage.removeItem("trakt_data"); // Clear the invalid data from local storage
+        localStorage.removeItem("trakt_data_file"); // Clear the associated file name as well
+        clearDatabase(TRAKT_DB_NAME, TRAKT_DB_VERSION, TRAKT_STORE_NAME, TRAKT_DATA_KEY).catch((cleanupError) => {
+            console.error("Failed to clear stored Trakt data:", cleanupError);
+        });
+        alert("Failed to parse the collected Trakt data. Please re-upload your Trakt data file and try again.");
+        location.reload(); // Reload the page to reset the form and status indicators
+        return;
+    }
+    if (!collectedData) {
+        alert("No Trakt data is available. Please upload your Trakt data file again.");
+        localStorage.removeItem("trakt_data_file"); // Clear the associated file name as well
+        location.reload(); // Reload the page to reset the form and status indicators
+        return;
+    }
+
+    return collectedData; // Return the collected data for further processing
+}
+
+async function displayTraktLists(listsContainer) {
+    let collectedData = await traktDataHandler();
+    if (!collectedData) {
+        return false; // Stop the function if no valid Trakt data is available
+    }
+
+    const sync_lists_choice = document.getElementById("sync_lists_choice");
+
+    const lists = collectedData['lists-lists'] || [];
+    for(const list of lists) {
+        const listId = list['ids']['trakt'];
+        const listName = list['name'];
+        const listPrivacy = list['privacy'] == "private" ? "Private" : "Public"; // Convert privacy to title case for display
+        const listItemCount = list['item_count'];
+        const listCheckbox = document.createElement("input");
+        const listForm = document.createElement("form");
+        listForm.appendChild(listCheckbox);
+        listsContainer.appendChild(listForm);
+        listCheckbox.type = "checkbox";
+        listCheckbox.id = `list-${listId}`;
+        listCheckbox.name = "list_sync_options";
+        listCheckbox.checked = sync_lists_choice.checked;
+        listCheckbox.value = "true";
+        const listLabel = document.createElement("label");
+        listLabel.htmlFor = `list-${listId}`;
+        listLabel.textContent = `"${listName}" (${listPrivacy}, ${listItemCount} Items)`;
+        listForm.appendChild(listCheckbox);
+        listForm.appendChild(listLabel);
+        listForm.appendChild(document.createElement("br"));
+    }
+    syncChildListCheckboxesWithParent()
+}
+
+function filterSyncOptions(syncOptionsJson) {
+    const listForm = document.querySelectorAll("input[name='list_sync_options']");
+
+    // Clear the relevant data in syncOptionsJson based on the state of the checkboxes to save bandwidth and avoid sending unnecessary data to the server.
+    if (!syncOptionsJson.sync_dropped_shows_choice) {
+        syncOptionsJson.trakt_data['hidden-calendar'] = []; // Clear the dropped shows if the checkbox is not checked
+    }
+    if (!syncOptionsJson.sync_lists_choice) {
+        syncOptionsJson.trakt_data['lists-lists'] = []; // Clear the lists if the parent checkbox is not checked
+    }
+    if (!syncOptionsJson.sync_movie_resume_points_choice) {
+        syncOptionsJson.trakt_data['watched-playback'] = syncOptionsJson.trakt_data['watched-playback'].filter(item => item.type !== "movie"); // Clear movie resume points if the checkbox is not checked
+    }
+    if (!syncOptionsJson.sync_movie_watch_history_choice) {
+        syncOptionsJson.trakt_data['watched-history'] = syncOptionsJson.trakt_data['watched-history'].filter(item => item.type !== "movie"); // Clear movie watch history if the checkbox is not checked
+    }
+    if (!syncOptionsJson.sync_show_resume_points_choice) {
+        syncOptionsJson.trakt_data['watched-playback'] = syncOptionsJson.trakt_data['watched-playback'].filter(item => item.type !== "episode"); // Clear episode resume points if the checkbox is not checked
+    }
+    if (!syncOptionsJson.sync_show_watch_history_choice) {
+        syncOptionsJson.trakt_data['watched-history'] = syncOptionsJson.trakt_data['watched-history'].filter(item => item.type !== "episode"); // Clear episode watch history if the checkbox is not checked
+    }
+    if (!syncOptionsJson.sync_watchlist_choice) {
+        syncOptionsJson.trakt_data['lists-watchlist'] = []; // Clear the watchlist if the checkbox is not checked
+    }
+
+    if (!listForm || listForm.length === 0) {
+        return syncOptionsJson; // No lists to filter, return the original JSON
+    }
+
+    const selectedLists = Array.from(listForm)
+        .filter(checkbox => checkbox.checked)
+        .map(checkbox => checkbox.id.replace("list-", "")); // Extract the list IDs from the checkbox IDs
+
+    if (selectedLists.length === 0) {
+        syncOptionsJson.trakt_data['lists-lists'] = []; // Clear the lists if no checkboxes are selected
+        return syncOptionsJson;
+    }
+
+    // Filter the lists based on the selected list IDs
+    syncOptionsJson.trakt_data['lists-lists'] = syncOptionsJson.trakt_data['lists-lists'].filter(traktList => selectedLists.includes(traktList['ids']['trakt'] + ""));
+    return syncOptionsJson;
+}
+
+// Add click behavior to the Trakt file status text to trigger file input when clicked
+const traktFileStatusText = document.querySelector(".trakt-file-status + .status-text");
+const traktWantedFiles = [
+    "watched-history",
+    "lists-watchlist",
+    "lists-lists",
+    "watched-playback",
+    "user-profile",
+    "hidden-calendar"
+]; // List of expected files in the Trakt export ZIP
+
+// Add click behavior to the Lists button to toggle the visibility of the lists container
+const chooseListsButton = document.getElementById("choose-lists");
+const listsContainer = document.querySelector(".lists-container");
+const syncListsChoice = document.getElementById("sync_lists_choice");
+
+function syncChildListCheckboxesWithParent() {
+    const listCheckboxes = document.querySelectorAll("input[name='list_sync_options']");
+    listCheckboxes.forEach((checkbox) => {
+        checkbox.checked = syncListsChoice.checked;
+        if (syncListsChoice.checked) {
+            checkbox.disabled = false; // Enable child checkboxes when parent is checked
+        } else {
+            checkbox.disabled = true; // Disable child checkboxes when parent is unchecked
+        }
+    });
+}
+
+if (syncListsChoice) {
+    syncListsChoice.addEventListener("change", syncChildListCheckboxesWithParent);
+}
+
+chooseListsButton.addEventListener("click", () => {
+    if (listsContainer.style.display === "none" || listsContainer.style.display === "") {
+        listsContainer.style.display = "block";
+        chooseListsButton.textContent = "▼"; // Change button text to indicate collapse
+        chooseListsButton.title = "Collapse Lists";
+        if (listsContainer.childElementCount === 0) {
+            displayTraktLists(listsContainer); // Call the function to display the lists
+        }
+    } else {
+        listsContainer.style.display = "none";
+        chooseListsButton.textContent = "▲"; // Change button text to indicate expand
+        chooseListsButton.title = "Expand Lists";
+    }
+});
+
+function failTraktFileImport(message, error) {
+    alert(message);
+    traktFileStatus.classList.remove("status-orange");
+    traktFileStatus.classList.remove("status-green");
+    traktFileStatus.classList.add("status-red");
+    traktFileStatusText.textContent = `Trakt Data File (Invalid File)`;
+    localStorage.removeItem("trakt_data_file");
+    localStorage.removeItem("trakt_data");
+    clearDatabase(TRAKT_DB_NAME, TRAKT_DB_VERSION, TRAKT_STORE_NAME, TRAKT_DATA_KEY).catch((cleanupError) => {
+        console.error("Failed to clear stored Trakt data:", cleanupError);
+    });
+    console.error(message, error);
+}
+
+if (traktFileStatusText) {
+    traktFileStatusText.addEventListener("click", () => {
+        const fileInput = document.createElement("input");
+        fileInput.type = "file";
+        fileInput.accept = ".zip"; // Accept ZIP files
+        fileInput.onchange = async (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                console.log("Selected Trakt export:", file.name);
+                traktFileStatus.classList.remove("status-red");
+                traktFileStatus.classList.add("status-orange");
+                traktFileStatusText.textContent = `Processing Trakt Data File (${file.name})`;
+
+                let zipReader;
+                try {
+                    zipReader = new zip.ZipReader(new zip.BlobReader(file));
+                    const entries = await zipReader.getEntries();
+
+                    if (entries.length) {
+                        console.log("ZIP file entries:", entries.map((entry) => entry.filename));
+                        localStorage.setItem("trakt_data_file", file.name); // Store the file name in local storage for display
+                        traktFileStatus.classList.remove("status-orange");
+                        traktFileStatus.classList.add("status-green");
+                        traktFileStatusText.textContent = `Trakt Data File (${file.name})`;
+                        var collectedData = {};
+
+                        // Parse each entry in the ZIP file and store its content in local storage
+                        for (const entry of entries) {
+                            if (!entry.directory) {
+                                var normalName = entry.filename.split(".")[0]; // Normalize the file name to match expected patterns
+                                for (const wantedFile of traktWantedFiles) {
+                                    if (normalName.startsWith(wantedFile)) {
+                                        normalName = wantedFile; // If the normalized name contains the expected pattern, use the expected pattern as the key
+                                        break;
+                                    }
+                                }
+                                console.log(`Found entry: ${entry.filename}, normalized to: ${normalName}`);
+                                if (!(entry.filename.endsWith(".json") && traktWantedFiles.includes(normalName))) {
+                                    console.warn(`Skipping not wanted: ${entry.filename}`);
+                                    continue; // Skip non-wanted files
+                                }
+
+                                const entryBlob = await entry.getData(new zip.BlobWriter());
+                                const entryText = await entryBlob.text();
+
+                                // Convert the entry text to JSON to validate it and catch any parsing errors early
+                                try {
+                                    const jsonFile = JSON.parse(entryText);
+                                } catch (error) {
+                                    failTraktFileImport(`Failed to parse ${entry.filename} as JSON. Please ensure the file is a valid Trakt data export.`);
+                                    return; // Stop processing if any file is invalid
+                                }
+
+                                const jsonData = JSON.parse(entryText);
+                                if (normalName === "user-profile") {
+                                    // Remove sensitive information from the user-profile data, so it never gets sent to the server.
+                                    jsonData["joined_at"] = "";
+                                    jsonData["location"] = "";
+                                    jsonData["about"] = "";
+                                    jsonData["gender"] = "";
+                                    jsonData["age"] = null;
+                                    jsonData["images"] = {};
+                                }
+                                if (normalName === "lists-lists") {
+                                    // Remove sensitive information from the list data, so it never gets sent to the server.
+                                    jsonData.forEach((traktList) => {
+                                        traktList["images"] = {};
+                                        traktList["user"] = {};
+                                    });
+                                }
+
+                                if (collectedData[normalName]) {
+                                    // Extend existing data if the file has already been processed (e.g., multiple history files)
+                                    try {
+                                        const existingData = collectedData[normalName];
+                                        const newData = jsonData;
+                                        collectedData[normalName] = existingData.concat(newData); // Merge arrays if both existing and new data are arrays
+
+                                    } catch (error) {
+                                        failTraktFileImport(`Failed to merge data for ${entry.filename}. Please ensure all files are valid and in the expected format.`);
+                                        return; // Stop processing if there's an error merging data
+                                    }
+                                } else {
+                                    collectedData[normalName] = jsonData;
+                                }
+                            }
+                        }
+
+                        if (!collectedData['lists-lists']) {
+                            collectedData['lists-lists'] = []; // Ensure lists-lists is at least an empty array if not present, to avoid errors later
+                        }
+
+                        for (const list in collectedData['lists-lists']) {
+                            const listId = collectedData['lists-lists'][list]['ids']['trakt'];
+                            console.log(`Processing list: ${collectedData['lists-lists'][list]['name']} with ID: ${listId}`);
+                            for (const entry of entries) {
+                                if (!entry.directory) {
+                                    if (entry.filename.startsWith(`lists-list-${listId}`) && entry.filename.endsWith(".json")) {
+                                        const entryBlob = await entry.getData(new zip.BlobWriter());
+                                        const entryText = await entryBlob.text();
+                                        try {
+                                            const jsonFile = JSON.parse(entryText);
+                                            collectedData[`lists-lists`][list][`items`] = jsonFile; // Store list items under list['items']
+                                        } catch (error) {
+                                            failTraktFileImport(`Failed to parse ${entry.filename} as JSON. Please ensure the file is a valid Trakt data export.`);
+                                            return; // Stop processing if any file is invalid
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        collectedData['file_name'] = file.name; // Store the original file name in the collected data for reference
+
+                        await setDatabase(collectedData, TRAKT_DB_NAME, TRAKT_DB_VERSION, TRAKT_STORE_NAME, TRAKT_DATA_KEY); // Store the collected data for the migration process to use
+                        // Do not write private export data to the browser console.
+                        location.reload(); // Reload only after successful processing so form visibility updates correctly
+                    } else {
+                        failTraktFileImport("The ZIP file is empty. Please upload a valid Trakt data export.");
+                    }
+                } catch (error) {
+                    if (error?.name === "QuotaExceededError") {
+                        failTraktFileImport("Browser storage quota was exceeded while importing Trakt data. Clear this site's stored data and try again.", error);
+                    } else {
+                        failTraktFileImport("Failed to read the ZIP file. Please ensure it's a valid Trakt data export.", error);
+                    }
+                } finally {
+                    if (zipReader) {
+                        await zipReader.close();
+                    }
+                }
+            }
+        };
+        fileInput.click();
+    });
+
+    const trakt_data_file = localStorage.getItem("trakt_data_file");
+    if (trakt_data_file) {
+        traktFileStatus.classList.remove("status-red");
+        traktFileStatus.classList.add("status-green");
+        traktFileStatusText.textContent = `Trakt Data File (${trakt_data_file})`;
+    }
+}
+
+const logsButton = document.getElementById("view-logs-button");
+const logsContainer = document.querySelector(".migration-logs");
+const logsContent = document.getElementById("migration-logs-content");
+const downloadLogsButton = document.getElementById("download-logs-button");
+
+logsButton.addEventListener("click", () => {
+    if (logsContainer.style.display === "none") {
+        const logs = localStorage.getItem("migration_logs") || "No logs available.";
+        logsContent.textContent = logs;
+        logsContainer.style.display = "block";
+        logsButton.textContent = "Hide Migration Logs";
+    } else {
+        logsContainer.style.display = "none";
+        logsButton.textContent = "View Migration Logs";
+    }
+});
+
+downloadLogsButton.addEventListener("click", () => {
+    const logs = localStorage.getItem("migration_logs") || "No logs available.";
+
+    if (logs === "No logs available.") {
+        alert("No logs available to download.");
+        return;
+    }
+
+    const blob = new Blob([logs], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `migration_logs_${new Date().toISOString()}.log`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+});
+
+function mark_all_dots_before(step) {
+    const steps = [
+        "watchlist",
+        "lists",
+        "show-history",
+        "movie-history",
+        "dropped-shows",
+        "show-resume",
+        "movie-resume",
+    ];
+    const stepIndex = Number(step) - 1;
+
+    if (stepIndex == -1) {
+        // Mark all dots as red and the first dot as orange to indicate the migration has started but no steps have been completed yet.
+        steps.forEach((step) => {
+            const dot = document.querySelector(`.${step}-status`);
+            if (dot) {
+                dot.classList.remove("status-green", "status-orange");
+                dot.classList.add("status-red");
+            }
+        });
+        const firstDot = document.querySelector(`.${steps[0]}-status`);
+        if (firstDot) {
+            firstDot.classList.remove("status-red", "status-green");
+            firstDot.classList.add("status-orange");
+        }
+        return;
+    }
+
+    if (Number.isNaN(stepIndex) || stepIndex < 0) {
+        return;
+    }
+
+    for (let i = 0; i < steps.length; i += 1) {
+        const dot = document.querySelector(`.${steps[i]}-status`);
+        if (!dot) {
+            continue;
+        }
+
+        dot.classList.remove("status-red", "status-orange", "status-green");
+
+        if (i <= stepIndex) {
+            dot.classList.add("status-green");
+        } else if (i === stepIndex + 1) {
+            dot.classList.add("status-orange");
+        } else {
+            dot.classList.add("status-red");
+        }
+    }
+}
+
+const syncForm = document.getElementById("sync-form");
+const syncSubmitButton = document.getElementById("sync-submit");
+
+// Explicitly block native form submit so checked boxes are never appended to the URL.
+syncForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+});
+
+syncSubmitButton.addEventListener("click", async () => {
+    // Build an object where each checkbox id maps to its checked state.
+    const syncOptions = Array.from(
+        document.querySelectorAll("input[name='sync_options']"),
+    ).reduce((options, checkbox) => {
+        options[checkbox.id] = checkbox.checked;
+        return options;
+    }, {});
+    let collectedData = await traktDataHandler();
+    if (!collectedData) {
+        return; // Stop the sync process if no valid Trakt data is available
+    }
+
+    syncOptions["trakt_data"] = collectedData; // Include the collected Trakt data from local storage in the sync options sent to the server
+    const syncJson = JSON.stringify(filterSyncOptions(syncOptions)); // Filter the lists based on the selected checkboxes before sending to the server
+
+    fetch("/migrate", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-Requested-With": "TraktMigration",
+        },
+        body: syncJson,
+    })
+        .then((response) => response.json())
+        .then((data) => {
+            if (data.success) {
+                alert(data.message);
+
+                if (data.events_url) {
+                    // Store the events URL in local storage so the status page can use it to listen for updates.
+                    localStorage.setItem("events_url", data.events_url);
+                    localStorage.removeItem("migration_logs"); // Clear any existing logs
+                    localStorage.setItem("migration_progress", "0"); // Initialize logs with a starting message
+                    location.reload(); // Reload the page to update the status indicators
+                }
+            } else {
+                alert("Failed to start sync. Please try again.");
+            }
+        });
+});
+
+function mark_form_as_hidden() {
+    const form = document.getElementById("sync-form");
+    if (form) {
+        form.style.display = "none";
+    }
+}
+
+// Check if the user is authenticated
+fetch("/auth/status")
+    .then((response) => response.json())
+    .then((data) => {
+        const pmdbStatusDot = document.querySelector(".pmdb-status");
+        const pmdbStatusText = document.querySelector(
+            ".pmdb-status + .status-text",
+        );
+        const traktStatusText = document.querySelector(
+            ".trakt-status + .status-text",
+        );
+
+        if (data.pmdb) {
+            pmdbStatusDot.classList.remove("status-red");
+            pmdbStatusDot.classList.add("status-green");
+            pmdbStatusText.innerText = "PublicMetaDb (Connected)";
+            document.getElementById("pmdb-logout").hidden = false;
+        } else {
+            pmdbStatusDot.classList.remove("status-green");
+            pmdbStatusDot.classList.add("status-red");
+            pmdbStatusText.innerText = "PublicMetaDb (Not Logged In)";
+
+            mark_form_as_hidden();
+        }
+    })
+    .catch((error) => {
+        console.error("Error checking PMDB authentication status:", error);
+    });
+
+// Hide form if Trakt Data File is not uploaded, as it's required for the migration to work.
+const traktFileStatusDot = document.querySelector(".trakt-file-status");
+if (traktFileStatusDot) {
+    if (traktFileStatusDot.classList.contains("status-red")) {
+        mark_form_as_hidden();
+    }
+}
+
+// Add click behavior to Trakt status text
+const traktStatusTextLink = document.querySelector(
+    ".trakt-status + .status-text",
+);
+
+let server_data = null;
+fetch("/status")
+    .then((response) => response.json())
+    .then((data) => {
+        server_data = data;
+        if (data.version) {
+            console.log(`Server version: ${data.version}`);
+        }
+        if (data.server_uptime_seconds !== undefined) {
+            console.log(`Server uptime (seconds): ${data.server_uptime_seconds}`);
+            if (data.server_uptime_seconds < 3600) { // If the server has been up for less than an hour, alert the user about potential migration processing.
+                alert(`The server was started ${Math.round(data.server_uptime_seconds / 60)} minutes ago. If you recently requested a migration please do not request another. The current migration is likely still processing. Progress updates may be delayed until the current migration is complete. You can always check "publicmetadb.com/my-progress" for live updates on your migration progress.`);
+            }
+        }
+
+
+    })
+    .catch((error) => {
+        console.error("Failed to fetch server status:", error);
+        alert("Failed to contact the server. Please try again.");
+    });
+if (traktStatusTextLink) {
+    traktStatusTextLink.addEventListener("click", () => {
+        if (server_data && server_data.trakt_url) {
+            window.location.href = server_data.trakt_url; // Redirect to the authentication URL
+        } else {
+            alert("Failed to get authentication URL. Please try again.");
+        }
+    });
+}
+
+const authDialog = document.getElementById("pmdb-auth-dialog");
+const apiKeyInput = document.getElementById("pmdb-api-key");
+const authError = document.getElementById("pmdb-auth-error");
+document.querySelector(".pmdb-status + .status-text").addEventListener("click", () => {
+    authError.textContent = "";
+    authDialog.showModal();
+    apiKeyInput.focus();
+});
+authDialog.addEventListener("close", () => { apiKeyInput.value = ""; });
+document.getElementById("pmdb-auth-cancel").addEventListener("click", () => authDialog.close());
+const authSubmit = document.getElementById("pmdb-auth-submit");
+authSubmit.addEventListener("click", async () => {
+    let apiKey = apiKeyInput.value.trim();
+    apiKeyInput.value = "";
+    if (!apiKey) return;
+    authSubmit.disabled = true;
+    try {
+        const response = await fetch("/pmdb/auth", {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${apiKey}`, "X-Requested-With": "TraktMigration" },
+        });
+        if (response.ok) {
+            authDialog.close();
+            location.reload();
+        } else {
+            authError.textContent = "Connection failed. Check your key and PMDB availability, then retry.";
+        }
+    } catch {
+        authError.textContent = "Connection failed. Please try again.";
+    } finally {
+        apiKey = "";
+        authSubmit.disabled = false;
+    }
+});
+document.getElementById("pmdb-logout").addEventListener("click", async () => {
+    const response = await fetch("/pmdb/logout", {
+        method: "POST", headers: { "X-Requested-With": "TraktMigration" },
+    });
+    if (response.ok) location.reload();
+});
+document.getElementById("toggle-all").addEventListener("change", (event) => toggle(event.target));
+
+function updateProgressBar(progress) {
+    const progressBar = document.querySelector(".skill-bar");
+    if (progressBar) {
+        progressBar.style.setProperty("--bar-width", `${progress}%`);
+        progressBar.setAttribute("data-progress", progress);
+    }
+}
+
+function appendMigrationLog(entry) {
+    const maxLogChars = 100000;
+    const existingLogs = localStorage.getItem("migration_logs") || "";
+    let updatedLogs = existingLogs + JSON.stringify(entry) + "\n";
+
+    if (updatedLogs.length > maxLogChars) {
+        updatedLogs = updatedLogs.slice(updatedLogs.length - maxLogChars);
+        const firstNewline = updatedLogs.indexOf("\n");
+        if (firstNewline > -1) {
+            updatedLogs = updatedLogs.slice(firstNewline + 1);
+        }
+    }
+
+    localStorage.setItem("migration_logs", updatedLogs);
+
+    if (logsContainer.style.display === "block") {
+        logsContent.textContent = updatedLogs;
+    }
+}
+
+// Track intentional page teardown so refresh/navigation does not trigger error cleanup.
+let isPageUnloading = false;
+window.addEventListener("beforeunload", () => {
+    isPageUnloading = true;
+});
+window.addEventListener("pagehide", () => {
+    isPageUnloading = true;
+});
+
+// Fetch migration event url from local storage and listen for updates
+const eventsUrl = localStorage.getItem("events_url");
+if (eventsUrl) {
+    mark_form_as_hidden(); // Hide the form if there's an active migration
+    progress = localStorage.getItem("migration_progress") || "0"; // Get the last known progress or default to 0
+    progress_number = Number(progress);
+    if (Number.isNaN(progress_number) || progress_number < 0) {
+        progress_number = 0;
+    } else if (progress_number > 100) {
+        progress_number = 100;
+    }
+    updateProgressBar(Math.round((progress_number / 6) * 100)); // Update the progress bar to the last known progress
+    mark_all_dots_before(progress_number); // Update the status dots based on the last known progress
+    const eventSource = new EventSource(eventsUrl);
+    let migrationEnded = false;
+    eventSource.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+
+        // Keep the stored log history bounded so the page does not retain unbounded SSE payloads.
+        if (data) {
+            appendMigrationLog(data);
+        }
+
+        if (data.step !== undefined) {
+            mark_all_dots_before(data.step);
+            localStorage.setItem("migration_progress", data.step); // Update the last known progress in local storage
+        }
+        if (data.progress) {
+            // Update the progress bar width based on the progress value (0-100)
+            updateProgressBar(data.progress);
+        }
+        if (data.type === "complete" || data.status === "completed") {
+            migrationEnded = true;
+            eventSource.close();
+            alert("Migration completed!");
+            localStorage.removeItem("events_url"); // Clear the events URL from local storage
+            localStorage.removeItem("migration_progress"); // Reset progress in local storage
+            localStorage.removeItem("trakt_data_file");
+            try {
+                await clearDatabase(TRAKT_DB_NAME, TRAKT_DB_VERSION, TRAKT_STORE_NAME, TRAKT_DATA_KEY);
+            } finally {
+                location.reload(); // Reload the page to release job data and reset the form
+            }
+        }
+        if (data.type === "error" || data.status === "error") {
+            alert(`Migration had an error: ${data.message}`);
+        }
+        if (data.type === "critical" || data.status === "critical") {
+            migrationEnded = true;
+            eventSource.close();
+            alert(`Critical Error - Migration aborted: ${data.message}`);
+            localStorage.removeItem("events_url"); // Clear the events URL from local storage
+            localStorage.removeItem("migration_progress"); // Reset progress in local storage
+            clearDatabase(TRAKT_DB_NAME, TRAKT_DB_VERSION, TRAKT_STORE_NAME, TRAKT_DATA_KEY).catch((cleanupError) => {
+                console.error("Failed to clear stored Trakt data:", cleanupError);
+            });
+            location.reload(); // Reload the page to reset the form and status indicators
+        }
+    };
+    eventSource.onerror = (error) => {
+        if (migrationEnded) {
+            eventSource.close();
+            localStorage.removeItem("migration_progress"); // Reset progress in local storage
+            localStorage.removeItem("events_url"); // Clear the events URL from local storage
+            return;
+        }
+        if (isPageUnloading) {
+            eventSource.close();
+            return;
+        }
+        eventSource.close();
+        console.error("Error with event source:", error);
+        appendMigrationLog({ message: "Connection lost. Please refresh the page." }); // Log the connection loss in migration logs
+        localStorage.removeItem("migration_progress"); // Reset progress in local storage
+        localStorage.removeItem("events_url"); // Clear the events URL from local storage
+        alert("Connection lost. Please refresh the page.");
+    };
+} else {
+    // No active migration, ensure the progress bar is reset and hidden
+    const progressBar = document.querySelector(".skill-bar");
+    const progressBox = document.querySelector(".sf-skill");
+    if (progressBar) {
+        progressBar.style.setProperty("--bar-width", "0%");
+        progressBar.setAttribute("data-progress", "0");
+        progressBox.style.display = "none"; // Hide the progress box when not in use
+    }
+
+    const statusDots = document.querySelector(".progress-dots");
+    if (statusDots) {
+        statusDots.style.display = "none"; // Hide the status dots when not in use
+    }
+}

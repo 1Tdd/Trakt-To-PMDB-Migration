@@ -37,6 +37,15 @@ class SyncContext:
 def log(message: str, ctx: SyncContext = None, level: str = "info") -> None:
     event_queue = ctx.event_queue if ctx else None
     username = ctx.username if ctx and ctx.username else "SYSTEM"
+    sensitive_values = [os.getenv(name) for name in ("pmdb_api_key", "trakt_client", "trakt_secret", "cookie_encryption_key")]
+    if ctx:
+        for headers in (ctx.pmdb_headers, ctx.trakt_headers):
+            if headers and headers.get("Authorization"):
+                sensitive_values.append(headers["Authorization"].split(" ")[-1])
+    for secret in sensitive_values:
+        if secret:
+            message = str(message).replace(secret, "[REDACTED]")
+            username = str(username).replace(secret, "[REDACTED]")
 
     def print_to_console():
         print(f"{username}: [{level.upper()}] {message}")
@@ -83,7 +92,7 @@ def add_user_information(token_data: dict, trakt_headers: dict) -> dict | None:
         token_data["username"] = user_info.get("user").get("username")
         return token_data
     else:
-        log(f"Failed to retrieve user information: {response.status_code} - {response.text}", level="error")
+        log(f"Failed to retrieve user information: {response.status_code}", level="error")
         return None
     
 def check_pmdb_token(token: str) -> bool:
@@ -93,10 +102,14 @@ def check_pmdb_token(token: str) -> bool:
     querystring = {"tmdb_id":"550","media_type":"movie"}
     headers = {"Authorization": "Bearer " + token}
 
-    response = requests.request("GET", url, headers=headers, params=querystring)
+    try:
+        response = requests.request("GET", url, headers=headers, params=querystring, timeout=20, allow_redirects=False)
+    except requests.RequestException:
+        log("PMDB validation request failed; sensitive details suppressed.", level="error")
+        return False
 
     if not (response.status_code >= 200 and response.status_code < 300):
-        log(f"PMDB token validation failed: {response.status_code} - {response.text}", level="error")
+        log(f"PMDB token validation failed: {response.status_code}", level="error")
 
     return response.status_code >= 200 and response.status_code < 300
 
@@ -144,7 +157,7 @@ def code_authorize_user() -> dict | None:
         elif response.status_code == 400:
             log("Waiting for user authorization...")
         else:
-            log(f"Error: {response.status_code} - {response.text}", level="error")
+            log(f"Error: {response.status_code}", level="error")
             break
 
 def parse_listed_at(value: str) -> datetime.datetime:
@@ -181,7 +194,7 @@ def fetch_watchlist(ctx: SyncContext) -> list | None:
         log(f"Watchlist fetched successfully. Total items: {len(watchlist)}", ctx=ctx)
         return watchlist
     else:
-        log(f"Failed to fetch watchlist: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to fetch watchlist: {response.status_code}", level="error", ctx=ctx)
         return []
 
 def get_pmdb_watchlist_id(ctx: SyncContext) -> str | None:
@@ -210,7 +223,7 @@ def get_pmdb_watchlist_id(ctx: SyncContext) -> str | None:
             log(f"New PMDB watchlist created with ID: {new_watchlist.get('item').get('id')}", ctx=ctx)
             return new_watchlist.get("item").get("id")
         else:
-            log(f"Failed to create PMDB watchlist: {response.status_code} - {response.text}", level="error", ctx=ctx)
+            log(f"Failed to create PMDB watchlist: {response.status_code}", level="error", ctx=ctx)
         return None
 
 def add_to_pmdb_list(ctx: SyncContext, pmdb_list_id: str, item: dict) -> bool:
@@ -239,7 +252,7 @@ def add_to_pmdb_list(ctx: SyncContext, pmdb_list_id: str, item: dict) -> bool:
         log(f"Added '{item.get('movie', item.get('show', {})).get('title')}' to PMDB watchlist.", level="verbose", ctx=ctx)
         return True
     else:
-        log(f"Failed to add '{item.get('movie', item.get('show', {})).get('title')}' to PMDB watchlist: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to add '{item.get('movie', item.get('show', {})).get('title')}' to PMDB watchlist: {response.status_code}", level="error", ctx=ctx)
     return False
 
 def sync_watchlist(ctx: SyncContext) -> bool:
@@ -289,7 +302,7 @@ def fetch_trakt_lists(ctx: SyncContext) -> list | None:
         log(f"Trakt lists fetched successfully. Total lists: {len(lists)}", ctx=ctx)
         return lists
     else:
-        log(f"Failed to fetch Trakt lists: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to fetch Trakt lists: {response.status_code}", level="error", ctx=ctx)
         return []
 
 def fetch_trakt_list(ctx: SyncContext, trakt_list: dict) -> list | None:
@@ -306,7 +319,7 @@ def fetch_trakt_list(ctx: SyncContext, trakt_list: dict) -> list | None:
     if response and response.status_code == 200:
         return response.json()
     else:
-        log(f"Failed to fetch Trakt list: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to fetch Trakt list: {response.status_code}", level="error", ctx=ctx)
         return []
 
 def add_list_to_pmdb(ctx: SyncContext, trakt_list: dict, trakt_list_items: list) -> bool:
@@ -338,7 +351,7 @@ def add_list_to_pmdb(ctx: SyncContext, trakt_list: dict, trakt_list_items: list)
 
         return all_success
     else:
-        log(f"Failed to create PMDB list '{trakt_list.get('name')}': {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to create PMDB list '{trakt_list.get('name')}': {response.status_code}", level="error", ctx=ctx)
         return False
 
 def sync_lists(ctx: SyncContext, sync_all: bool = True) -> bool:
@@ -391,7 +404,7 @@ def submit_watched_timestamp_to_pmdb(ctx: SyncContext, tmdb_id: int, type: str, 
     if response.status_code >= 200 and response.status_code < 300 and response.json().get("success"):
         return True
     else:
-        log(f"Failed to submit watch history for TMDB ID {tmdb_id} to PMDB: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to submit watch history for TMDB ID {tmdb_id} to PMDB: {response.status_code}", level="error", ctx=ctx)
         return False
     
 def submit_history_movie_to_pmdb(ctx: SyncContext, movie: dict) -> bool:
@@ -456,7 +469,7 @@ def sync_movie_watch_history(ctx: SyncContext) -> bool:
                     movie_watch_times = response.json()
                     movie["history"] = movie_watch_times
                 else:
-                    log(f"Failed to fetch watch history for movie '{movie.get('movie', {}).get('title')}' (Trakt ID: {movie.get('movie', {}).get('ids', {}).get('trakt')}): {response.status_code} - {response.text}", level="error", ctx=ctx)
+                    log(f"Failed to fetch watch history for movie '{movie.get('movie', {}).get('title')}' (Trakt ID: {movie.get('movie', {}).get('ids', {}).get('trakt')}): {response.status_code}", level="error", ctx=ctx)
                     all_success = False
 
             success = submit_history_movie_to_pmdb(ctx, movie)
@@ -465,7 +478,7 @@ def sync_movie_watch_history(ctx: SyncContext) -> bool:
         return all_success
 
     else:
-        log(f"Failed to fetch watched movies: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to fetch watched movies: {response.status_code}", level="error", ctx=ctx)
         return False
     
 def add_show_watch_history(ctx: SyncContext, show: dict) -> dict:
@@ -481,7 +494,7 @@ def add_show_watch_history(ctx: SyncContext, show: dict) -> dict:
                     if response.status_code == 200:
                         season_details = response.json()
                     else:
-                        log(f"Failed to fetch season details for show '{show.get('show', {}).get('title')}' season {season.get('number')}: {response.status_code} - {response.text}", level="error", ctx=ctx)
+                        log(f"Failed to fetch season details for show '{show.get('show', {}).get('title')}' season {season.get('number')}: {response.status_code}", level="error", ctx=ctx)
                         continue
 
                 for detailed_episode in season_details:
@@ -492,7 +505,7 @@ def add_show_watch_history(ctx: SyncContext, show: dict) -> dict:
                             episode_watch_times = response.json()
                             episode["history"] = episode_watch_times
                         else:
-                            log(f"Failed to fetch watch history for episode '{episode.get('title')}' (Trakt ID: {episode.get('ids', {}).get('trakt')}): {response.status_code} - {response.text}", level="error", ctx=ctx)
+                            log(f"Failed to fetch watch history for episode '{episode.get('title')}' (Trakt ID: {episode.get('ids', {}).get('trakt')}): {response.status_code}", level="error", ctx=ctx)
 
     return show
 
@@ -604,7 +617,7 @@ def sync_show_watch_history(ctx: SyncContext) -> bool:
 
         return all_success
     else:
-        log(f"Failed to fetch watched shows: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to fetch watched shows: {response.status_code}", level="error", ctx=ctx)
         return False
     
 def submit_resume_point_batch_to_pmdb(ctx: SyncContext, batch: list) -> bool:
@@ -651,7 +664,7 @@ def submit_resume_point_batch_to_pmdb(ctx: SyncContext, batch: list) -> bool:
         log(f"Failed to submit resume points for some of {len(submit_list)} items to PMDB: {response.status_code}. Check the logs for details.", level="error", ctx=ctx)
         return False
     else:
-        log(f"Failed to submit resume points batch to PMDB: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to submit resume points batch to PMDB: {response.status_code}", level="error", ctx=ctx)
         return False
 
 def submit_resume_point_to_pmdb(ctx: SyncContext, item: dict) -> bool:
@@ -685,7 +698,7 @@ def submit_resume_point_to_pmdb(ctx: SyncContext, item: dict) -> bool:
         return True
     else:
         media_label = "Movie" if item_type == "movie" else "Show"
-        log(f"Failed to submit resume point for {media_label} '{item_spesific.get('title')}' (Trakt ID: {ids.get('trakt')}) to PMDB: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to submit resume point for {media_label} '{item_spesific.get('title')}' (Trakt ID: {ids.get('trakt')}) to PMDB: {response.status_code}", level="error", ctx=ctx)
         return False
 
 def sync_resume_points(ctx: SyncContext, sync_type: str) -> bool:
@@ -741,7 +754,7 @@ def sync_resume_points(ctx: SyncContext, sync_type: str) -> bool:
 
         return all_success
     else:
-        log(f"Failed to fetch {sync_type} resume points: {response.status_code} - {response.text}", level="error", ctx=ctx)
+        log(f"Failed to fetch {sync_type} resume points: {response.status_code}", level="error", ctx=ctx)
         return False
 
 def submit_dropped_shows_to_pmdb(ctx: SyncContext, dropped_shows: list) -> bool:
@@ -772,7 +785,7 @@ def submit_dropped_shows_to_pmdb(ctx: SyncContext, dropped_shows: list) -> bool:
             log(f"Submitted dropped show '{show.get('show', {}).get('title')}' to PMDB.", level="verbose", ctx=ctx)
         else:
             all_success = False
-            log(f"Failed to submit dropped show '{show.get('show', {}).get('title')}' to PMDB: {response.status_code} - {response.text}", level="error", ctx=ctx)
+            log(f"Failed to submit dropped show '{show.get('show', {}).get('title')}' to PMDB: {response.status_code}", level="error", ctx=ctx)
 
     return all_success
 
