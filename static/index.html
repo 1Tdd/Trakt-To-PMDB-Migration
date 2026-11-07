@@ -56,7 +56,14 @@
             Sync Movie Watch History</label><br />
         <input type="checkbox" id="sync_dropped_shows_choice" name="sync_options" value="true" />
         <label for="sync_dropped_shows_choice">
-            Sync Dropped Shows [WIP]</label><br />
+            Sync Dropped Shows</label>
+        <button type="button" id="toggle-dropped" aria-controls="dropped-picker" aria-expanded="false" title="Expand Dropped Shows" hidden>▲</button><br />
+        <fieldset id="dropped-picker" hidden>
+            <legend>Select shows you dropped</legend>
+            <label for="dropped-search">Search your export by show title</label>
+            <input type="search" id="dropped-search" />
+            <div id="dropped-options"></div>
+        </fieldset>
         <input type="checkbox" id="sync_show_resume_points_choice" name="sync_options" value="true" />
         <label for="sync_show_resume_points_choice">
             Sync Show Progress/Resume Points</label><br />
@@ -110,6 +117,8 @@
 
     <button id="view-logs-button">View Migration Logs</button> <button id="download-logs-button">Download Migration
         Logs</button>
+    <button id="clear-local-data" type="button">Delete local export and logs</button>
+    <p>Local export and logs expire after 24 hours; cleanup runs while this page is open or when you return.</p>
     <div class="migration-logs" style="display: none;">
         <h4>Migration Logs</h4>
         <pre id="migration-logs-content"></pre>
@@ -125,6 +134,8 @@
         also support the project by sharing it with others who might find it useful, contributing to the codebase, or
         providing feedback and suggestions for improvement.
     </p>
+
+    <p><strong>About dropped shows.</strong> A Trakt ZIP may include your viewing history without listing which shows you dropped. An unfinished series could still be in progress. When Sync Dropped Shows is selected, shows already listed as dropped in the ZIP are imported automatically. The manual picker appears only if that list is missing or empty. Select any shows you want to mark as dropped by name.</p>
 
     <p class="disclaimer">
         Notice: I am not responsible for anything the script might change, break, or mess up with either Trakt or PMDB.

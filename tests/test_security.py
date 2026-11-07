@@ -19,6 +19,7 @@ HEADERS = {"Origin": "https://migration.test", "X-Requested-With": "TraktMigrati
 
 class SecurityTests(unittest.TestCase):
     def setUp(self):
+        webserver.auth_budget = webserver.RateBudget()
         webserver.sessions.clear()
         webserver.running_jobs.clear()
         self.client = TestClient(webserver.app, base_url="https://migration.test")
@@ -26,6 +27,15 @@ class SecurityTests(unittest.TestCase):
     def login(self, key=FAKE_KEY):
         with patch.object(webserver, "check_pmdb_token", return_value=True):
             return self.client.post("/pmdb/auth", headers={**HEADERS, "Authorization": "Bearer " + key})
+
+    def test_auth_rate_limit_stops_provider_requests(self):
+        webserver.auth_budget = webserver.RateBudget(limit=1)
+        self.assertEqual(self.login().status_code, 200)
+        with patch.object(webserver, "check_pmdb_token") as check:
+            result = self.client.post("/pmdb/auth", headers={**HEADERS, "Authorization": "Bearer " + FAKE_KEY})
+        self.assertEqual(result.status_code, 429)
+        self.assertEqual(result.headers["retry-after"], "60")
+        check.assert_not_called()
 
     def test_cookie_is_opaque_secure_and_does_not_contain_credentials(self):
         response = self.login()

@@ -1,5 +1,7 @@
 import datetime
+import math
 import queue
+from credentials import ProtectedHeaders
 
 import requests
 from dotenv import load_dotenv
@@ -13,10 +15,22 @@ load_dotenv()
 
 trakt_api_url = "https://api.trakt.tv"
 pmdb_api_url = "https://publicmetadb.com/api"
-version = "1.1.1"
+version = "1.1.2"
 userAgent = f"TraktMigration/{version}"
 
-session = requests.Session()
+REQUEST_TIMEOUT = (5, 30)
+
+
+class BoundedSession(requests.Session):
+    """Bound every API operation; writes are deliberately never retried."""
+
+    def request(self, method, url, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = REQUEST_TIMEOUT
+        return super().request(method, url, **kwargs)
+
+
+session = BoundedSession()
 session.headers.update({
     "Content-Type": "application/json",
     "User-Agent": userAgent
@@ -32,7 +46,7 @@ class SyncContext:
 
     @property
     def username(self) -> str:
-        return self.trakt_profile.get("username", "")
+        return (self.trakt_profile or {}).get("username", "")
     
 def log(message: str, ctx: SyncContext = None, level: str = "info") -> None:
     event_queue = ctx.event_queue if ctx else None
@@ -64,6 +78,41 @@ def log(message: str, ctx: SyncContext = None, level: str = "info") -> None:
     elif (os.getenv("domain", "").replace(" ", "") == "" or os.getenv("domain", "").lower() == "required_if_using_as_a_webserver_with_webserver.py"):
         print(f"{username}: [{level.upper()}] {message}")
 
+
+def report_item_progress(ctx: SyncContext, completed: int, total: int, message: str) -> None:
+    """Publish at most about 100 safe updates per loop, without per-item payloads."""
+    if not ctx.event_queue or total <= 0:
+        return
+    stride = max(1, math.ceil(total / 100))
+    if completed not in {0, 1, total} and completed % stride:
+        return
+    event = {"type": "item_progress", "completed": completed, "total": total, "message": message}
+    if getattr(ctx, "migration_step", None) is not None:
+        event["step"] = ctx.migration_step
+    if getattr(ctx, "migration_stage", None) is not None:
+        event["stage"] = ctx.migration_stage
+    try:
+        ctx.event_queue.put_nowait(event)
+    except queue.Full:
+        pass
+
+
+def resolve_tmdb_id(ctx: SyncContext, media: dict, media_type: str):
+    ids = media.get("ids") or {}
+    if ids.get("tmdb"):
+        return ids["tmdb"]
+    if not ids.get("trakt"):
+        log("Missing media identifiers; the item cannot be imported.", ctx=ctx, level="error")
+        return None
+    response = session.get(pmdb_api_url + "/external/mappings/lookup", headers=ctx.pmdb_headers,
+                           params={"id_type": "trakt", "id_value": ids["trakt"], "media_type": media_type})
+    if response.status_code == 200:
+        for result in response.json().get("results") or []:
+            if result.get("tmdb_id"):
+                return result["tmdb_id"]
+    log("Could not resolve a media identifier; the item was not imported.", ctx=ctx, level="error")
+    return None
+
 def create_trakt_headers(token_data: dict = None) -> dict:
     headers = {
         "trakt-api-version": "2",
@@ -77,7 +126,7 @@ def create_trakt_headers(token_data: dict = None) -> dict:
 
 def build_sync_context(pmdb_api_key: str, event_queue: queue.Queue = None, trakt_data: dict = None) -> SyncContext:
     return SyncContext(
-        pmdb_headers={"Authorization": "Bearer " + pmdb_api_key},
+        pmdb_headers=ProtectedHeaders(pmdb_api_key),
         event_queue=event_queue,
         trakt_data=trakt_data,
         trakt_profile=trakt_data.get("user-profile") if trakt_data else None,
@@ -161,41 +210,30 @@ def code_authorize_user() -> dict | None:
             break
 
 def parse_listed_at(value: str) -> datetime.datetime:
-    if not value:
-        return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    fallback = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    if not isinstance(value, str) or not value:
+        return fallback
     try:
-        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
     except ValueError:
-        return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+        return fallback
 
 def fetch_watchlist(ctx: SyncContext) -> list | None:
     log("Fetching watchlist...", ctx=ctx)
-
-    if ctx.trakt_data and ctx.trakt_data.get("lists-watchlist") is not None:
+    if ctx.trakt_data is not None and ctx.trakt_data.get("lists-watchlist") is not None:
         log("Using watchlist from provided trakt_data.", ctx=ctx)
-        watchlist = ctx.trakt_data.get("lists-watchlist")
-
-        # Sort by converting 'listed_at' date to a datetime object in ascending order to maintain consistency with how items are added to PMDB
-        watchlist.sort(key=lambda x: parse_listed_at(x.get("listed_at")))
-        return watchlist
-
-    url = trakt_api_url + f"/users/{ctx.username}/watchlist/all/added/asc"
-
-    response = None
-    if ctx.trakt_headers:
-        log("Fetching watchlist from Trakt API...", ctx=ctx)
-        response = session.get(url, headers=ctx.trakt_headers) if ctx.trakt_data else None
-    else:
-        log("No Trakt headers available. Skipping fetch of watchlist.", level="warning", ctx=ctx)
-        return []
-
-    if response and response.status_code == 200:
-        watchlist = response.json()
-        log(f"Watchlist fetched successfully. Total items: {len(watchlist)}", ctx=ctx)
-        return watchlist
-    else:
-        log(f"Failed to fetch watchlist: {response.status_code}", level="error", ctx=ctx)
-        return []
+        return sorted(ctx.trakt_data["lists-watchlist"], key=lambda item: parse_listed_at(item.get("listed_at")))
+    if not ctx.trakt_headers:
+        log("Watchlist data is missing and no Trakt API credentials are available.", level="error", ctx=ctx)
+        return None
+    response = session.get(trakt_api_url + f"/users/{ctx.username}/watchlist/all/added/asc", headers=ctx.trakt_headers)
+    if response.status_code == 200:
+        return response.json()
+    log(f"Failed to fetch watchlist: {response.status_code}", level="error", ctx=ctx)
+    return None
 
 def get_pmdb_watchlist_id(ctx: SyncContext) -> str | None:
     log("Retrieving PMDB watchlist ID...", ctx=ctx)
@@ -218,7 +256,7 @@ def get_pmdb_watchlist_id(ctx: SyncContext) -> str | None:
             "type": "watchlist"
         }
         response = session.post(url, headers=ctx.pmdb_headers, json=body)
-        if response.status_code >= 200 and response.status_code < 300 and response.json().get("success") and response.json().get("item").get("id"):
+        if response.status_code >= 200 and response.status_code < 300 and response.json().get("success") and (response.json().get("item") or {}).get("id"):
             new_watchlist = response.json()
             log(f"New PMDB watchlist created with ID: {new_watchlist.get('item').get('id')}", ctx=ctx)
             return new_watchlist.get("item").get("id")
@@ -227,100 +265,71 @@ def get_pmdb_watchlist_id(ctx: SyncContext) -> str | None:
         return None
 
 def add_to_pmdb_list(ctx: SyncContext, pmdb_list_id: str, item: dict) -> bool:
-
-    tmdb_id = item.get("movie", item.get("show", {})).get("ids", {}).get("tmdb")
-
-    if not tmdb_id:
-        body = {
-            "id_type": "trakt",
-            "id_value": item.get("ids", {}).get("trakt")
-        }
-
-        id_response = session.get(pmdb_api_url + "/external/mappings/lookup", headers=ctx.pmdb_headers, json=body)
-        if id_response.status_code == 200:
-            tmdb_id = id_response.json().get("results", [{}])[0].get("tmdb_id")
-
-    url = pmdb_api_url + f"/external/lists/{pmdb_list_id}/items"
-    body = {
-        "listId": pmdb_list_id,
-        "media_type": "movie" if item.get("type") == "movie" else "tv",
-        "tmdb_id": tmdb_id
-    }
-
-    response = session.post(url, headers=ctx.pmdb_headers, json=body)
-    if response.status_code >= 200 and response.status_code < 300 and response.json().get("success"):
-        log(f"Added '{item.get('movie', item.get('show', {})).get('title')}' to PMDB watchlist.", level="verbose", ctx=ctx)
+    media_type = "movie" if item.get("type") == "movie" else "tv"
+    media = item.get("movie", item.get("show", {}))
+    tmdb_id = resolve_tmdb_id(ctx, media, media_type)
+    if not pmdb_list_id or tmdb_id is None:
+        return False
+    response = session.post(pmdb_api_url + f"/external/lists/{pmdb_list_id}/items", headers=ctx.pmdb_headers,
+                            json={"listId": pmdb_list_id, "media_type": media_type, "tmdb_id": tmdb_id})
+    if 200 <= response.status_code < 300 and response.json().get("success"):
         return True
-    else:
-        log(f"Failed to add '{item.get('movie', item.get('show', {})).get('title')}' to PMDB watchlist: {response.status_code}", level="error", ctx=ctx)
+    log(f"Failed to add an item to PMDB list: {response.status_code}", level="error", ctx=ctx)
     return False
 
 def sync_watchlist(ctx: SyncContext) -> bool:
     log("Syncing watchlist...", ctx=ctx)
     watchlist = fetch_watchlist(ctx)
+    if watchlist is None:
+        return False
+    if not watchlist:
+        log("No watchlist items to import.", ctx=ctx)
+        return True
     pmdb_watchlist_id = get_pmdb_watchlist_id(ctx)
-
+    if not pmdb_watchlist_id:
+        log("Could not obtain the PMDB watchlist; no items were submitted.", level="error", ctx=ctx)
+        return False
     all_success = True
-
-    for item in watchlist:
-        success = add_to_pmdb_list(ctx, pmdb_watchlist_id, item)
-
-        if not success:
+    report_item_progress(ctx, 0, len(watchlist), "Importing watchlist items")
+    for index, item in enumerate(watchlist, 1):
+        if not add_to_pmdb_list(ctx, pmdb_watchlist_id, item):
             all_success = False
-
-    if all_success:
-        log("Watchlist synced successfully!", ctx=ctx)
-    else:
-        log("Watchlist synced with some errors. Please check the logs for details.", level="error", ctx=ctx)
+        report_item_progress(ctx, index, len(watchlist), "Importing watchlist items")
+    log("Watchlist synced successfully!" if all_success else "Watchlist synced with some errors. Please check the logs for details.",
+        level="info" if all_success else "error", ctx=ctx)
+    return all_success
 
 def fetch_trakt_lists(ctx: SyncContext) -> list | None:
     log("Fetching Trakt lists...", ctx=ctx)
-
-    if ctx.trakt_data and ctx.trakt_data.get("lists-lists") is not None:
+    if ctx.trakt_data is not None and ctx.trakt_data.get("lists-lists") is not None:
         log("Using lists from provided trakt_data.", ctx=ctx)
-
         sorted_lists = []
-        for trakt_list in ctx.trakt_data.get("lists-lists") or []:
-            items = trakt_list.get("items") or []
-            sorted_items = sorted(items, key=lambda x: parse_listed_at(x.get("listed_at")))
-            sorted_lists.append({**trakt_list, "items": sorted_items})  # no in-place mutation
-
+        for trakt_list in ctx.trakt_data["lists-lists"]:
+            if trakt_list.get("items") is not None:
+                sorted_items = sorted(trakt_list["items"], key=lambda item: parse_listed_at(item.get("listed_at")))
+                sorted_lists.append({**trakt_list, "items": sorted_items})
+            else:
+                sorted_lists.append(dict(trakt_list))
         return sorted_lists
-
-    url = trakt_api_url + f"/users/{ctx.username}/lists"
-
-    response = None
-    if ctx.trakt_headers:
-        log("Fetching Trakt lists from Trakt API...", ctx=ctx)
-        response = session.get(url, headers=ctx.trakt_headers) if ctx.trakt_headers else None
-    else:
-        log("No Trakt headers available. Skipping fetch of Trakt lists.", level="warning", ctx=ctx)
-        return []
-
-    if response and response.status_code == 200:
-        lists = response.json()
-        log(f"Trakt lists fetched successfully. Total lists: {len(lists)}", ctx=ctx)
-        return lists
-    else:
-        log(f"Failed to fetch Trakt lists: {response.status_code}", level="error", ctx=ctx)
-        return []
+    if not ctx.trakt_headers:
+        log("Custom list data is missing and no Trakt API credentials are available.", level="error", ctx=ctx)
+        return None
+    response = session.get(trakt_api_url + f"/users/{ctx.username}/lists", headers=ctx.trakt_headers)
+    if response.status_code == 200:
+        return response.json()
+    log(f"Failed to fetch Trakt lists: {response.status_code}", level="error", ctx=ctx)
+    return None
 
 def fetch_trakt_list(ctx: SyncContext, trakt_list: dict) -> list | None:
-    url = trakt_api_url + f"/users/{ctx.username}/lists/{trakt_list.get('ids').get('trakt')}/items/all/added/asc"
-
-    response = None
-    if ctx.trakt_headers:
-        log(f"Fetching items for Trakt list '{trakt_list.get('name')}' from Trakt API...", ctx=ctx)
-        response = session.get(url, headers=ctx.trakt_headers) if ctx.trakt_headers else None
-    else:
-        log(f"No Trakt headers available. Skipping fetch of items for Trakt list '{trakt_list.get('name')}'.", level="warning", ctx=ctx)
-        return []
-
-    if response and response.status_code == 200:
+    if not ctx.trakt_headers:
+        log("Custom list items are missing and no Trakt API credentials are available.", level="error", ctx=ctx)
+        return None
+    url = trakt_api_url + f"/users/{ctx.username}/lists/{(trakt_list.get('ids') or {}).get('trakt')}/items/all/added/asc"
+    response = session.get(url, headers=ctx.trakt_headers)
+    if response.status_code == 200:
         return response.json()
-    else:
-        log(f"Failed to fetch Trakt list: {response.status_code}", level="error", ctx=ctx)
-        return []
+    log(f"Failed to fetch Trakt list: {response.status_code}", level="error", ctx=ctx)
+    return None
 
 def add_list_to_pmdb(ctx: SyncContext, trakt_list: dict, trakt_list_items: list) -> bool:
     log(f"Adding list '{trakt_list.get('name')}' to PMDB...", level="verbose", ctx=ctx)
@@ -334,17 +343,19 @@ def add_list_to_pmdb(ctx: SyncContext, trakt_list: dict, trakt_list_items: list)
     }
 
     response = session.post(url, headers=ctx.pmdb_headers, json=body)
-    if response.status_code >= 200 and response.status_code < 300 and response.json().get("success") and response.json().get("item").get("id"):
+    if response.status_code >= 200 and response.status_code < 300 and response.json().get("success") and (response.json().get("item") or {}).get("id"):
         pmdb_list = response.json()
         pmdb_list_id = pmdb_list.get("item").get("id")
 
         all_success = True
 
-        for item in trakt_list_items:
+        report_item_progress(ctx, 0, len(trakt_list_items), "Importing custom list items")
+        for index, item in enumerate(trakt_list_items, 1):
             success = add_to_pmdb_list(ctx, pmdb_list_id, item)
             if not success:
                 all_success = False
                 log(f"Failed to add item '{item.get('movie', item.get('show', {})).get('title')}' to PMDB list '{trakt_list.get('name')}'.", level="error", ctx=ctx)
+            report_item_progress(ctx, index, len(trakt_list_items), "Importing custom list items")
 
         if not all_success:
             log(f"List '{trakt_list.get('name')}' added to PMDB with some errors. Please check the logs for details.", level="error", ctx=ctx)
@@ -356,32 +367,30 @@ def add_list_to_pmdb(ctx: SyncContext, trakt_list: dict, trakt_list_items: list)
 
 def sync_lists(ctx: SyncContext, sync_all: bool = True) -> bool:
     trakt_lists = fetch_trakt_lists(ctx)
-
-    #sync_all = input("Do you want to sync all lists? (y/n): ").lower().replace(" ", "") == "y"
+    if trakt_lists is None:
+        return False
     if sync_all:
         log("Syncing all lists...", ctx=ctx)
-
     all_success = True
-
-    for trakt_list in trakt_lists:
+    report_item_progress(ctx, 0, len(trakt_lists), "Importing custom lists")
+    for index, trakt_list in enumerate(trakt_lists, 1):
         if not sync_all:
-            sync_list = input(f"Do you want to sync the list '{trakt_list.get('name')}' (https://trakt.tv/users/{ctx.username}/lists/{trakt_list.get('ids').get('trakt')})? (y/n): ").lower().replace(" ", "") == "y"
+            sync_list = input(f"Sync list '{trakt_list.get('name')}'? (y/n): ").strip().lower() == "y"
             if not sync_list:
-                log(f"Skipping list '{trakt_list.get('name')}'...", ctx=ctx)
+                report_item_progress(ctx, index, len(trakt_lists), "Importing custom lists")
                 continue
-
-        log(f"Syncing list '{trakt_list.get('name')}'...", ctx=ctx)
-
-        trakt_list_items = trakt_list.get("items") or fetch_trakt_list(ctx, trakt_list)
-
-        success = add_list_to_pmdb(ctx, trakt_list, trakt_list_items)
-
-        if success:
-            log(f"List '{trakt_list.get('name')}' synced successfully!", ctx=ctx)
-        else:
+        trakt_list_items = trakt_list.get("items")
+        if trakt_list_items is None:
+            trakt_list_items = fetch_trakt_list(ctx, trakt_list)
+        if trakt_list_items is None:
             all_success = False
-            log(f"Failed to sync list '{trakt_list.get('name')}'. Please check the logs for details.", level="error", ctx=ctx)
-
+            continue
+        success = add_list_to_pmdb(ctx, trakt_list, trakt_list_items)
+        if not success:
+            all_success = False
+        log("Custom list synced successfully!" if success else "Failed to sync a custom list. Check the logs for details.",
+            level="info" if success else "error", ctx=ctx)
+        report_item_progress(ctx, index, len(trakt_lists), "Importing custom lists")
     return all_success
 
 def submit_watched_timestamp_to_pmdb(ctx: SyncContext, tmdb_id: int, type: str, watched_at: str, season: int = None, episode: int = None) -> bool:
@@ -396,7 +405,7 @@ def submit_watched_timestamp_to_pmdb(ctx: SyncContext, tmdb_id: int, type: str, 
         "watched_at": watched_at
     }
 
-    if season and episode:
+    if season is not None and episode is not None:
         body["season"] = season
         body["episode"] = episode
 
@@ -409,18 +418,10 @@ def submit_watched_timestamp_to_pmdb(ctx: SyncContext, tmdb_id: int, type: str, 
     
 def submit_history_movie_to_pmdb(ctx: SyncContext, movie: dict) -> bool:
 
-    tmdb_id = movie.get("movie", {}).get("ids", {}).get("tmdb")
+    tmdb_id = resolve_tmdb_id(ctx, movie.get("movie", {}), "movie")
+    if tmdb_id is None:
+        return False
 
-    if not tmdb_id:
-        body = {
-            "id_type": "trakt",
-            "id_value": movie.get("movie", {}).get("ids", {}).get("trakt")
-        }
-
-        id_response = session.get(pmdb_api_url + "/external/mappings/lookup", headers=ctx.pmdb_headers, json=body)
-        if id_response.status_code == 200:
-            tmdb_id = id_response.json().get("results", [{}])[0].get("tmdb_id")
-    
     if movie.get("history", []):
         all_success = True
 
@@ -453,6 +454,10 @@ def sync_movie_watch_history(ctx: SyncContext) -> bool:
             log("Movie watch history failed to sync.", ctx=ctx)
         return success
     
+    if not ctx.trakt_headers:
+        log("Movie history data is missing and no Trakt API credentials are available.", level="error", ctx=ctx)
+        return False
+
     url = trakt_api_url + f"/users/{ctx.username}/watched/movies"
     
     response = session.request("GET", url, headers=ctx.trakt_headers)
@@ -510,18 +515,9 @@ def add_show_watch_history(ctx: SyncContext, show: dict) -> dict:
     return show
 
 def submit_history_show_to_pmdb(ctx: SyncContext, show: dict) -> bool:
-    tmdb_id = show.get("show", {}).get("ids", {}).get("tmdb")
-
-    if not tmdb_id:
-        body = {
-            "id_type": "trakt",
-            "id_value": show.get("show", {}).get("ids", {}).get("trakt"),
-            "media_type": "tv"
-        }
-
-        id_response = session.get(pmdb_api_url + "/external/mappings/lookup", headers=ctx.pmdb_headers, json=body)
-        if id_response.status_code == 200:
-            tmdb_id = id_response.json().get("results", [{}])[0].get("tmdb_id")
+    tmdb_id = resolve_tmdb_id(ctx, show.get("show", {}), "tv")
+    if tmdb_id is None:
+        return False
 
     all_success = True
 
@@ -548,39 +544,36 @@ def submit_history_show_to_pmdb(ctx: SyncContext, show: dict) -> bool:
     return all_success
 
 def submit_exported_history_to_pmdb(ctx: SyncContext, media_type: str, history: list) -> bool:
-    all_success = True
-
-    if media_type not in ["movie", "episode"]:
-        log(f"Invalid media type '{media_type}' for history export. Skipping.", level="error", ctx=ctx)
+    if media_type not in {"movie", "episode"}:
+        log("Invalid media type for history export.", level="error", ctx=ctx)
         return False
-
+    all_success = True
+    total = sum(1 for item in history if item.get("type") == media_type)
+    completed = 0
+    report_item_progress(ctx, 0, total, "Importing watch history")
     for item in history:
-        if item.get("type") == media_type:
-            log(f"Processing {media_type} '{item.get('movie', item.get('show', {})).get('title')}' with watch timestamp '{item.get('watched_at')}'", ctx=ctx, level="verbose")
-            watched_at = item.get("watched_at", "1970-01-01T00:00:00.000Z")
-            tmdb_id = item.get("movie", item.get("show", {})).get("ids", {}).get("tmdb")
-
-            if not tmdb_id:
-                body = {
-                    "id_type": "trakt",
-                    "id_value": item.get("movie", item.get("show", {})).get("ids", {}).get("trakt"),
-                    "media_type": "movie" if item.get("type") == "movie" else "tv"
-                }
-
-                id_response = session.get(pmdb_api_url + "/external/mappings/lookup", headers=ctx.pmdb_headers, json=body)
-                if id_response.status_code == 200:
-                    tmdb_id = id_response.json().get("results", [{}])[0].get("tmdb_id")
-
-            success = False
-            if item.get("type") == "movie":
-                success = submit_watched_timestamp_to_pmdb(ctx=ctx, tmdb_id=tmdb_id, type="movie", watched_at=watched_at)
-            else:
-                success = submit_watched_timestamp_to_pmdb(ctx=ctx, tmdb_id=tmdb_id, type="tv", watched_at=watched_at, season=item.get("episode", {}).get("season"), episode=item.get("episode", {}).get("number"))
-
-            if not success:
+        if item.get("type") != media_type:
+            continue
+        media = item.get("movie", item.get("show", {}))
+        target_type = "movie" if media_type == "movie" else "tv"
+        tmdb_id = resolve_tmdb_id(ctx, media, target_type)
+        if tmdb_id is None:
+            all_success = False
+        else:
+            episode = item.get("episode") or {}
+            if media_type == "episode" and (episode.get("season") is None or episode.get("number") is None):
+                log("Missing season or episode number; the history item was not imported.", level="error", ctx=ctx)
                 all_success = False
-                log(f"Failed to submit watch history for '{item.get('movie', item.get('show', {})).get('title')}' (TMDB ID: {tmdb_id}) to PMDB.", level="error", ctx=ctx)
-
+            else:
+                success = submit_watched_timestamp_to_pmdb(
+                    ctx=ctx, tmdb_id=tmdb_id, type=target_type,
+                    watched_at=item.get("watched_at", "1970-01-01T00:00:00.000Z"),
+                    season=episode.get("season") if media_type == "episode" else None,
+                    episode=episode.get("number") if media_type == "episode" else None)
+                if not success:
+                    all_success = False
+        completed += 1
+        report_item_progress(ctx, completed, total, "Importing watch history")
     return all_success
 
 def sync_show_watch_history(ctx: SyncContext) -> bool:
@@ -595,6 +588,10 @@ def sync_show_watch_history(ctx: SyncContext) -> bool:
         else:
             log("Show watch history failed to sync.", level="error", ctx=ctx)
         return success
+
+    if not ctx.trakt_headers:
+        log("Show history data is missing and no Trakt API credentials are available.", level="error", ctx=ctx)
+        return False
 
     url = trakt_api_url + f"/users/{ctx.username}/watched/shows"
 
@@ -620,7 +617,52 @@ def sync_show_watch_history(ctx: SyncContext) -> bool:
         log(f"Failed to fetch watched shows: {response.status_code}", level="error", ctx=ctx)
         return False
     
+def report_resume_outcomes(ctx: SyncContext, data: dict, expected: int) -> bool:
+    """PMDB policy outcomes are handled successfully, but are not all saved."""
+    counts = {"saved": 0, "ignored": 0, "completed": 0}
+    if not isinstance(data, dict):
+        log("Invalid PMDB resume response.", level="error", ctx=ctx)
+        return False
+    results = data.get("results")
+    summary = data.get("summary", {})
+    valid = True
+    if results is not None:
+        valid = isinstance(results, list) and len(results) == expected
+        for result in results if isinstance(results, list) else []:
+            action = result.get("action") if isinstance(result, dict) else None
+            if isinstance(action, str) and action in counts:
+                counts[action] += 1
+            else:
+                valid = False
+        # Do not hide errors explicitly reported by the provider.
+        if not isinstance(summary, dict) or summary.get("errors", 0) != 0:
+            valid = False
+        # If supplied, summary counts must agree with the per-item results.
+        elif any(name in summary and (type(summary[name]) is not int or summary[name] != count)
+                 for name, count in counts.items()):
+            valid = False
+    elif isinstance(summary, dict):
+        for action in counts:
+            value = summary.get(action, 0)
+            if type(value) is not int or value < 0:
+                valid = False
+            else:
+                counts[action] = value
+        valid = valid and summary.get("errors", 0) == 0 and sum(counts.values()) == expected
+    else:
+        valid = False
+    log(f"PMDB resume outcomes: {counts['saved']} saved, "
+        f"{counts['ignored']} ignored (below 2% progress), "
+        f"{counts['completed']} completed (at least 80%; resume point cleared).", ctx=ctx)
+    if not valid:
+        log("PMDB resume response contains errors, unknown outcomes or missing results.", level="error", ctx=ctx)
+    return valid
+
+
 def submit_resume_point_batch_to_pmdb(ctx: SyncContext, batch: list) -> bool:
+
+    if not batch:
+        return True
 
     submit_list = []        
 
@@ -652,17 +694,7 @@ def submit_resume_point_batch_to_pmdb(ctx: SyncContext, batch: list) -> bool:
 
     response = session.post(pmdb_api_url + "/external/resume/batch", headers=ctx.pmdb_headers, json={"items": submit_list})
     if response.status_code >= 200 and response.status_code < 300:
-        data = response.json()
-        summary = data.get("summary", {}) 
-        if summary.get("saved", 0) == len(submit_list):
-            return True
-
-        for result in data.get("results", []):
-            if result.get("action") != "saved":
-                media_label = "Movie" if result.get("media_type") == "movie" else "Show"
-                log(f"Failed to submit resume point for {media_label} with TMDB ID {result.get('tmdb_id')} to PMDB: {result.get('action')}", level="error", ctx=ctx)
-        log(f"Failed to submit resume points for some of {len(submit_list)} items to PMDB: {response.status_code}. Check the logs for details.", level="error", ctx=ctx)
-        return False
+        return report_resume_outcomes(ctx, response.json(), len(submit_list))
     else:
         log(f"Failed to submit resume points batch to PMDB: {response.status_code}", level="error", ctx=ctx)
         return False
@@ -694,8 +726,8 @@ def submit_resume_point_to_pmdb(ctx: SyncContext, item: dict) -> bool:
         body["episode"] = item.get("episode", {}).get("number")
 
     response = session.post(url, headers=ctx.pmdb_headers, json=body)
-    if response.status_code >= 200 and response.status_code < 300 and response.json().get("action") == "saved":
-        return True
+    if response.status_code >= 200 and response.status_code < 300:
+        return report_resume_outcomes(ctx, {"results": [response.json()]}, 1)
     else:
         media_label = "Movie" if item_type == "movie" else "Show"
         log(f"Failed to submit resume point for {media_label} '{item_spesific.get('title')}' (Trakt ID: {ids.get('trakt')}) to PMDB: {response.status_code}", level="error", ctx=ctx)
@@ -703,108 +735,69 @@ def submit_resume_point_to_pmdb(ctx: SyncContext, item: dict) -> bool:
 
 def sync_resume_points(ctx: SyncContext, sync_type: str) -> bool:
     log(f"Syncing {sync_type} resume points...", ctx=ctx)
-    
-    sync_type_singular = "movie" if sync_type == "movies" else "episode"
-
-    progress_data = []
-    if ctx.trakt_data and ctx.trakt_data.get("watched-playback") is not None:
+    if sync_type not in {"movies", "episodes"}:
+        log("Invalid resume-point media type.", level="error", ctx=ctx)
+        return False
+    singular = "movie" if sync_type == "movies" else "episode"
+    if ctx.trakt_data is not None and ctx.trakt_data.get("watched-playback") is not None:
         log(f"Using {sync_type} resume points from provided trakt_data.", ctx=ctx)
-        resume_points = ctx.trakt_data.get("watched-playback")
-        sorted_resume_points = sorted(resume_points, key=lambda x: parse_listed_at(x.get("paused_at")), reverse=False)
-        progress_data = [item for item in sorted_resume_points if item.get("type") == sync_type_singular]
-
-    url = trakt_api_url + f"/sync/playback/{sync_type}"
-    response = None
-    if ctx.trakt_headers:
-        log(f"Fetching {sync_type} resume points from Trakt API...", ctx=ctx)
-        response = session.get(url, headers=ctx.trakt_headers) if ((not progress_data) and ctx.trakt_headers) else None
+        playback = ctx.trakt_data["watched-playback"]
+    elif ctx.trakt_headers:
+        response = session.get(trakt_api_url + f"/sync/playback/{sync_type}", headers=ctx.trakt_headers)
+        if response.status_code != 200:
+            log(f"Failed to fetch {sync_type} resume points: {response.status_code}", level="error", ctx=ctx)
+            return False
+        playback = response.json()
     else:
-        log(f"No Trakt headers available. Skipping fetch of {sync_type} resume points from Trakt API.", level="warning", ctx=ctx)
+        log("Playback data is missing and no Trakt API credentials are available.", level="error", ctx=ctx)
         return False
-
-    if response is None or response.status_code == 200:
-        progress_data = response.json() if progress_data == [] else progress_data
-
-        all_success = True
-
-        batched_data = []
-        batch_size = 50  # Adjust batch size as needed
-
-        for show in progress_data:
-            batched_data.append(show)
-
-            if len(batched_data) >= batch_size:
-                success = submit_resume_point_batch_to_pmdb(ctx, batched_data)
-                if not success:
-                    all_success = False
-                    log("Failed to submit a batch of resume points to PMDB. Please check the logs for details.", level="error", ctx=ctx)
-                batched_data = []
-
-        # Submit any remaining items that didn't fill a complete batch
-        if batched_data:
-            success = submit_resume_point_batch_to_pmdb(ctx, batched_data)
-            if not success:
-                all_success = False
-                log("Failed to submit the final batch of resume points to PMDB. Please check the logs for details.", level="error", ctx=ctx)
-            
-        if all_success:
-            log(f"{sync_type.capitalize()} resume points synced successfully!", ctx=ctx)
-        else:
-            log(f"{sync_type.capitalize()} resume points synced with some errors. Please check the logs for details.", level="error", ctx=ctx)
-
-        return all_success
-    else:
-        log(f"Failed to fetch {sync_type} resume points: {response.status_code}", level="error", ctx=ctx)
+    if not isinstance(playback, list):
+        log("Playback data must be an array.", level="error", ctx=ctx)
         return False
+    progress_data = sorted((item for item in playback if item.get("type") == singular),
+                           key=lambda item: parse_listed_at(item.get("paused_at")))
+    if not progress_data:
+        log(f"No {sync_type} resume points to import.", ctx=ctx)
+        return True
+    all_success = True
+    total = len(progress_data)
+    report_item_progress(ctx, 0, total, "Importing resume points")
+    for offset in range(0, total, 50):
+        batch = progress_data[offset:offset + 50]
+        if not submit_resume_point_batch_to_pmdb(ctx, batch):
+            all_success = False
+        report_item_progress(ctx, min(offset + len(batch), total), total, "Importing resume points")
+    log(f"{sync_type.capitalize()} resume points synced successfully!" if all_success else
+        f"{sync_type.capitalize()} resume points synced with some errors. Please check the logs for details.",
+        level="info" if all_success else "error", ctx=ctx)
+    return all_success
 
 def submit_dropped_shows_to_pmdb(ctx: SyncContext, dropped_shows: list) -> bool:
     all_success = True
-
-    for show in dropped_shows:
-        tmdb_id = show.get("show", {}).get("ids", {}).get("tmdb")
-
-        if not tmdb_id:
-            body = {
-                "id_type": "trakt",
-                "id_value": show.get("show", {}).get("ids", {}).get("trakt"),
-                "media_type": "tv"
-            }
-
-            id_response = session.get(pmdb_api_url + "/external/mappings/lookup", headers=ctx.pmdb_headers, json=body)
-            if id_response.status_code == 200:
-                tmdb_id = id_response.json().get("results", [{}])[0].get("tmdb_id")
-
-        url = pmdb_api_url + "/external/dropped"
-        body = {
-            "media_type": "tv",
-            "tmdb_id": tmdb_id
-        }
-
-        response = session.post(url, headers=ctx.pmdb_headers, json=body)
-        if response.status_code >= 200 and response.status_code < 300 and response.json().get("success"):
-            log(f"Submitted dropped show '{show.get('show', {}).get('title')}' to PMDB.", level="verbose", ctx=ctx)
-        else:
+    report_item_progress(ctx, 0, len(dropped_shows), "Importing dropped shows")
+    for index, show in enumerate(dropped_shows, 1):
+        tmdb_id = resolve_tmdb_id(ctx, show.get("show", {}), "tv")
+        if tmdb_id is None:
             all_success = False
-            log(f"Failed to submit dropped show '{show.get('show', {}).get('title')}' to PMDB: {response.status_code}", level="error", ctx=ctx)
-
+        else:
+            response = session.post(pmdb_api_url + "/external/dropped", headers=ctx.pmdb_headers,
+                                    json={"media_type": "tv", "tmdb_id": tmdb_id})
+            if not (200 <= response.status_code < 300 and response.json().get("success")):
+                all_success = False
+                log(f"Failed to submit a dropped show to PMDB: {response.status_code}", level="error", ctx=ctx)
+        report_item_progress(ctx, index, len(dropped_shows), "Importing dropped shows")
     return all_success
 
-def sync_dropped_shows(ctx):
+def sync_dropped_shows(ctx: SyncContext) -> bool:
     log("Syncing dropped shows...", ctx=ctx)
-
-    dropped_shows = []
-    if ctx.trakt_data and ctx.trakt_data.get("hidden-calendar") is not None:
-        log(f"Using dropped shows from provided trakt_data.", ctx=ctx)
-        dropped_shows = ctx.trakt_data.get("hidden-calendar")
-
-    if dropped_shows:
-        success = submit_dropped_shows_to_pmdb(ctx, dropped_shows)
-        if success:
-            log("Dropped shows synced successfully!", ctx=ctx)
-        else:
-            log("Dropped shows failed to sync.", level="error", ctx=ctx)
-        
-        return success
-    else:
-        log("No dropped shows found in the provided trakt_data. Skipping sync.", level="info", ctx=ctx)
+    if ctx.trakt_data is None or ctx.trakt_data.get("hidden-dropped") is None:
+        log("Dropped-show data is missing from the export.", level="error", ctx=ctx)
         return False
+    dropped_shows = ctx.trakt_data["hidden-dropped"]
+    if not dropped_shows:
+        log("No dropped shows to import.", ctx=ctx)
+        return True
+    success = submit_dropped_shows_to_pmdb(ctx, dropped_shows)
+    log("Dropped shows synced successfully!" if success else "Dropped shows failed to sync.",
+        level="info" if success else "error", ctx=ctx)
+    return success

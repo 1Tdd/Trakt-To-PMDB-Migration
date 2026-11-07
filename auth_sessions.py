@@ -4,6 +4,7 @@ import hashlib
 import secrets
 import threading
 import time
+from credentials import ProtectedCredential
 
 SESSION_TTL_SECONDS = 3600
 
@@ -30,16 +31,24 @@ class SessionStore:
             self._purge()
             if len(self._entries) >= self.capacity:
                 raise OverflowError("Session capacity reached")
-            self._entries[self._digest(token)] = (api_key, self.clock() + self.ttl)
+            self._entries[self._digest(token)] = (ProtectedCredential(api_key), self.clock() + self.ttl)
         return token
 
-    def get(self, token):
+    def _entry(self, token):
         if not token or len(token) > 128:
             return None
         with self._lock:
             self._purge()
             entry = self._entries.get(self._digest(token))
             return entry[0] if entry else None
+
+    def get(self, token):
+        credential = self._entry(token)
+        return credential.reveal() if credential else None
+
+    def owner(self, token):
+        credential = self._entry(token)
+        return credential.owner_digest if credential else None
 
     def revoke(self, token):
         if token:
