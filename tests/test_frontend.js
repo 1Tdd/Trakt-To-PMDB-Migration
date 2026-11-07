@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'static', 'app.js'), 'utf8');
-const functionNames = ['exportBasename', 'normaliseExportEntryName', 'matchesListExportEntry',
+const functionNames = ['describeLogEntry', 'exportBasename', 'normaliseExportEntryName', 'matchesListExportEntry',
     'migrationStartError', 'migrationPayload', 'filterSyncOptions', 'restoredMigrationProgress', 'migrationOutcome', 'isTerminalMigrationEvent', 'finalizeMigration', 'renderStageResults', 'clearPrivateLocalData', 'setPrivateDataExpiry', 'expirePrivateLocalData'];
 const extracted = functionNames.map(name => {
     const match = source.match(new RegExp('^(?:async )?function ' + name + '\\([^]*?^}', 'm'));
@@ -301,4 +301,40 @@ test('migration admission failures explain the relevant recovery action', () => 
     assert.match(context.migrationStartError(503), /temporarily unavailable/);
     assert.match(context.migrationStartError(401), /Reconnect PMDB/);
     assert.match(context.migrationStartError(413), /upload limit/);
+});
+
+test('log presentation distinguishes failed, warning and successful outcomes', () => {
+    const ctx = vm.createContext({});
+    vm.runInContext(extracted, ctx);
+    assert.equal(ctx.describeLogEntry({type: 'complete', success: false}).level, 'error');
+    assert.equal(ctx.describeLogEntry({type: 'complete', success: true, steps: [{name: 'History', status: 'failed', option: 'history'}]}).level, 'error');
+    assert.equal(ctx.describeLogEntry({type: 'complete', success: true}).level, 'success');
+    assert.equal(ctx.describeLogEntry({type: 'critical'}).level, 'error');
+    assert.equal(ctx.describeLogEntry({type: 'log', level: 'warning', message: 'Skipped'}).level, 'warning');
+    assert.equal(ctx.describeLogEntry({type: 'progress', status: 'completed', message: 'One stage'}).level, 'info');
+    assert.equal(ctx.describeLogEntry({message: '<script>alert(1)</script>'}).message, '<script>alert(1)</script>');
+    assert.equal(ctx.describeLogEntry(null).level, 'info');
+});
+
+test('log renderer preserves raw text and treats HTML as text while filtering issues', () => {
+    const raw = '{"level":"info","message":"hello"}\n{"level":"warning","message":"<img src=x onerror=alert(1)>"}\n{"level":"error","message":"failed"}\n';
+    const node = () => ({children: [], textContent: '', appendChild(child) { this.children.push(child); }});
+    const content = {replaceChildren(fragment) { this.children = fragment.children; }};
+    const filter = {checked: false};
+    const ctx = vm.createContext({localStorage: {getItem: () => raw}, logsContent: content,
+        document: {getElementById: () => filter, createDocumentFragment: node,
+            createElement: () => node(), createTextNode: text => ({textContent: text})}});
+    vm.runInContext(extracted, ctx);
+    vm.runInContext(source.match(/^function renderMigrationLogs\([^]*?^}/m)[0], ctx);
+    ctx.renderMigrationLogs();
+    assert.equal(content.children.map(x => x.textContent).join(''), raw);
+    assert.deepEqual(content.children.filter(x => x.className).map(x => [x.className, x.textContent]),
+        [['log-warning', 'warning'], ['log-error', 'error']]);
+    ctx.localStorage.getItem = () => JSON.stringify({success: true}) + "\n" + JSON.stringify({success: false}) + "\n";
+    ctx.renderMigrationLogs();
+    assert.deepEqual(content.children.filter(x => x.className).map(x => x.className), ['log-success']);
+    ctx.localStorage.getItem = () => raw;
+    filter.checked = true;
+    ctx.renderMigrationLogs();
+    assert.equal(content.children.map(x => x.textContent).join(''), raw.split('\n').slice(1).join('\n'));
 });

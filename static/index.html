@@ -22,7 +22,8 @@
         <h2>Connect PublicMetaDb</h2>
         <label for="pmdb-api-key">PMDB API key</label>
         <input id="pmdb-api-key" type="password" autocomplete="off" spellcheck="false" />
-        <p>Your key stays in server memory for up to one hour, or while an active migration needs it. It is not saved in cookies or files.</p>
+        <p>Your PMDB key is sent securely to this server to authorize the migration. It is kept encrypted in server memory and decrypted when needed to contact PMDB, not saved in cookies or files. Your session lasts one hour; a running migration keeps the key until it finishes.</p>
+        <p>Disconnect PMDB ends your session, but does not stop a running migration or revoke your API key at PMDB.</p>
         <p id="pmdb-auth-error" role="alert"></p>
         <button type="button" id="pmdb-auth-submit">Connect</button>
         <button type="button" id="pmdb-auth-cancel">Cancel</button>
@@ -118,10 +119,10 @@
     <button id="view-logs-button">View Migration Logs</button> <button id="download-logs-button">Download Migration
         Logs</button>
     <button id="clear-local-data" type="button">Delete local export and logs</button>
-    <p>Local export and logs expire after 24 hours; cleanup runs while this page is open or when you return.</p>
     <div class="migration-logs" style="display: none;">
         <h4>Migration Logs</h4>
-        <pre id="migration-logs-content"></pre>
+        <label><input type="checkbox" id="migration-log-issues"> Show only errors and warnings</label>
+        <pre id="migration-logs-content" aria-label="Migration log entries"></pre>
     </div>
 
     <p class="support">
@@ -136,6 +137,21 @@
     </p>
 
     <p><strong>About dropped shows.</strong> A Trakt ZIP may include your viewing history without listing which shows you dropped. An unfinished series could still be in progress. When Sync Dropped Shows is selected, shows already listed as dropped in the ZIP are imported automatically. The manual picker appears only if that list is missing or empty. Select any shows you want to mark as dropped by name.</p>
+
+    <section class="data-notice" aria-labelledby="data-notice-title">
+        <h2 id="data-notice-title">Your data and privacy</h2>
+        <p>Your imported export and migration logs are saved in this browser so you can return to them. Closing the tab does not delete them or stop a running migration.</p>
+        <details>
+            <summary>What is stored, for how long, and how to delete it</summary>
+            <p><strong>In your browser:</strong> the imported export expires 24 hours after import; logs expire separately, 24 hours after their first entry. This page checks for expired data when you open it and every minute while it stays open. If the browser is closed, expired data remains stored until you return to this site.</p>
+            <p><strong>After migration:</strong> once this page receives a successful result, it removes the imported export from browser storage. If the migration fails or only partly succeeds, the export stays available for retry until its expiry. Logs remain until their own expiry.</p>
+            <p><strong>On our server:</strong> the ZIP is opened in your browser. Only the fields needed for your selected migration steps are sent to the server and used to import data into PMDB. The export filename and Trakt profile stay in your browser. The app processes migration data in server memory and releases its references to job data when the job ends; this is not guaranteed secure erasure of every memory copy. A completion summary remains temporarily available for reconnecting, with a 10-minute expiry; expired summaries are removed by periodic cleanup, and may be removed sooner when capacity is reached.</p>
+            <p><strong>Your PMDB key:</strong> it is kept encrypted in server memory, with temporary decryption when needed. Your browser receives a session cookie, not the key. Sessions expire after one hour; a running migration retains its key until it finishes. Encryption does not protect against a fully compromised server.</p>
+            <p><strong>You are in control:</strong> use <em>Delete local export and logs</em> above to remove this site's stored export and logs from this browser. Use <em>Disconnect PMDB</em> to end your session. Neither action cancels a running migration or removes data already imported into PMDB. To revoke the API key itself, do so in PMDB.</p>
+            <p><strong>Files on your device:</strong> the original ZIP and any logs you download are not deleted by this site. Delete those files yourself when you no longer need them. Browser storage is separate for each browser and site address.</p>
+        </details>
+    </section>
+
 
     <p class="disclaimer">
         Notice: I am not responsible for anything the script might change, break, or mess up with either Trakt or PMDB.

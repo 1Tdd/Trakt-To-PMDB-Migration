@@ -497,10 +497,57 @@ const logsContainer = document.querySelector(".migration-logs");
 const logsContent = document.getElementById("migration-logs-content");
 const downloadLogsButton = document.getElementById("download-logs-button");
 
+function describeLogEntry(entry) {
+    if (!entry || typeof entry !== "object") return { level: "info", message: String(entry ?? "") };
+    const failed = entry.type === "critical" || entry.level === "error" ||
+        (entry.type === "complete" && !migrationOutcome(entry).success);
+    const level = failed ? "error" : ["warning", "warn"].includes(entry.level) ? "warning" :
+        entry.type === "complete" ? "success" : "info";
+    let message = typeof entry.message === "string" ? entry.message : "Migration update";
+    if (entry.type === "complete" || entry.type === "critical") {
+        message = level === "success" ? "Migration completed successfully." :
+            "Migration did not fully succeed. Review the failed stages in PMDB before retrying; your export is preserved.";
+    }
+    const steps = Array.isArray(entry.steps) ? entry.steps.map(step =>
+        `${step.name || step.id || "Stage"}: ${step.status || "unknown"}`).join(" · ") : "";
+    return { level, message: message + (steps ? "\n" + steps : "") };
+}
+
+function renderMigrationLogs() {
+    const raw = localStorage.getItem("migration_logs") || "";
+    const onlyIssues = document.getElementById("migration-log-issues").checked;
+    const fragment = document.createDocumentFragment();
+    let shown = 0;
+    for (const line of raw.split("\n").filter(Boolean)) {
+        let level = "info";
+        try { level = describeLogEntry(JSON.parse(line)).level; } catch {}
+        if (onlyIssues && !["error", "warning"].includes(level)) continue;
+        // Preserve the original JSON text; only decorate the severity value.
+        const highlights = /("level"\s*:\s*")(error|warning|warn|success)(")|(")(success)("\s*:\s*true\b)/gi;
+        let cursor = 0;
+        for (const match of line.matchAll(highlights)) {
+            const word = match[2] || match[5];
+            const start = match.index + (match[1] || match[4]).length;
+            fragment.appendChild(document.createTextNode(line.slice(cursor, start)));
+            const severity = document.createElement("span");
+            severity.className = word.toLowerCase() === "error" ? "log-error" :
+                word.toLowerCase() === "success" ? "log-success" : "log-warning";
+            severity.textContent = word;
+            fragment.appendChild(severity);
+            cursor = start + word.length;
+        }
+        fragment.appendChild(document.createTextNode(line.slice(cursor) + "\n"));
+        shown++;
+    }
+    logsContent.replaceChildren(fragment);
+    if (!shown) logsContent.textContent = onlyIssues ? "No errors or warnings in the retained logs." : "No logs available.";
+}
+
+document.getElementById("migration-log-issues").addEventListener("change", renderMigrationLogs);
+
 logsButton.addEventListener("click", () => {
     if (logsContainer.style.display === "none") {
-        const logs = localStorage.getItem("migration_logs") || "No logs available.";
-        logsContent.textContent = logs;
+        renderMigrationLogs();
         logsContainer.style.display = "block";
         logsButton.textContent = "Hide Migration Logs";
     } else {
@@ -783,8 +830,9 @@ function appendMigrationLog(entry) {
     if (!localStorage.getItem("logs_expires_at")) setPrivateDataExpiry("logs_expires_at");
     localStorage.setItem("migration_logs", updatedLogs);
 
+
     if (logsContainer.style.display === "block") {
-        logsContent.textContent = updatedLogs;
+        renderMigrationLogs();
     }
 }
 

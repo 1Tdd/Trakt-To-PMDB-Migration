@@ -133,6 +133,15 @@
 }
 
 /* Offset the lists div */
+.data-notice { margin: 20px 0; padding: 16px; border: 1px solid #64717e; border-radius: 8px; text-align: left; }
+.data-notice h2 { font-size: 1.15em; margin-top: 0; }
+.data-notice p { line-height: 1.6; }
+.data-notice summary { cursor: pointer; font-weight: bold; }
+.data-notice summary:focus-visible { outline: 2px solid currentColor; outline-offset: 4px; }
+.log-success { color: #77d69c; }
+.log-error { color: #ff8585; }
+.log-warning { color: #f3cb68; }
+
 .lists-container {
   position: relative;
   left: 20px;
