@@ -146,3 +146,7 @@
   position: relative;
   left: 20px;
 }
+
+#resume-review { max-width: min(800px, 90vw); }
+#resume-review-items { max-height: 50vh; overflow: auto; text-align: left; margin: 16px 0; }
+#resume-review-items label { display: inline-block; padding: 6px 0; }

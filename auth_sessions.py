@@ -31,7 +31,7 @@ class SessionStore:
             self._purge()
             if len(self._entries) >= self.capacity:
                 raise OverflowError("Session capacity reached")
-            self._entries[self._digest(token)] = (ProtectedCredential(api_key), self.clock() + self.ttl)
+            self._entries[self._digest(token)] = (ProtectedCredential(api_key), self.clock() + self.ttl, hashlib.sha256(api_key.encode()).hexdigest())
         return token
 
     def _entry(self, token):
@@ -40,15 +40,15 @@ class SessionStore:
         with self._lock:
             self._purge()
             entry = self._entries.get(self._digest(token))
-            return entry[0] if entry else None
+            return entry if entry else None
 
     def get(self, token):
         credential = self._entry(token)
-        return credential.reveal() if credential else None
+        return credential[0].reveal() if credential and credential[0] else None
 
     def owner(self, token):
         credential = self._entry(token)
-        return credential.owner_digest if credential else None
+        return credential[2] if credential else None
 
     def revoke(self, token):
         if token:
@@ -62,3 +62,15 @@ class SessionStore:
     def clear(self):
         with self._lock:
             self._entries.clear()
+
+    def forget_owner_key(self, owner):
+        """Keep identity-only access to results, never a reusable credential."""
+        with self._lock:
+            for key, entry in list(self._entries.items()):
+                if secrets.compare_digest(entry[2], owner):
+                    self._entries[key] = (None, entry[1], entry[2])
+
+    def status(self, token):
+        entry = self._entry(token)
+        return {"pmdb": bool(entry and entry[0]), "can_view_results": bool(entry),
+                "expires_in": max(0, int(entry[1] - self.clock())) if entry else 0}

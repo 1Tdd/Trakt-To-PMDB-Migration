@@ -594,6 +594,50 @@ syncForm.addEventListener("submit", (event) => {
     event.preventDefault();
 });
 
+function resumeReviewRows(data, options) {
+    function identity(row) {
+        const media = row.type === "episode" ? row.show : row.movie;
+        const ids = media?.ids || {};
+        const id = ids.tmdb ? `tmdb:${ids.tmdb}` : ids.trakt ? `trakt:${ids.trakt}` : null;
+        return id ? `${row.type}:${id}:${row.episode?.season ?? ""}:${row.episode?.number ?? ""}` : null;
+    }
+    const watched = new Set((data["watched-history"] || []).map(identity).filter(Boolean));
+    return (data["watched-playback"] || []).map((row, index) => ({row, index})).filter(({row}) =>
+        (row.type === "episode" && options.sync_show_resume_points_choice) ||
+        (row.type === "movie" && options.sync_movie_resume_points_choice)).map(({row, index}) => {
+        const title = (row.show || row.movie)?.title || "Untitled item";
+        const episode = row.type === "episode" ? ` S${row.episode?.season}E${row.episode?.number}` : "";
+        const warning = watched.has(identity(row)) ? " — Already watched in this export: check whether this pause is still wanted." : "";
+        return {index, label: `${title}${episode} — ${row.progress}% — paused ${row.paused_at || "at an unknown date"}${warning}`};
+    });
+}
+
+async function reviewResumePoints(data, options) {
+    const rows = resumeReviewRows(data, options);
+    if (!rows.length) return true;
+    const dialog = document.getElementById("resume-review");
+    const list = document.getElementById("resume-review-items");
+    list.replaceChildren();
+    for (const row of rows) {
+        const label = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = true;
+        box.value = String(row.index);
+        label.append(box, document.createTextNode(row.label));
+        list.append(label, document.createElement("br"));
+    }
+    dialog.returnValue = "cancel";
+    const accepted = new Promise(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue === "continue"), {once: true}));
+    dialog.showModal();
+    if (!await accepted) return false;
+    const excluded = new Set(Array.from(list.querySelectorAll("input:not(:checked)")).map(box => Number(box.value)));
+    data["watched-playback"] = data["watched-playback"].filter((row, index) => !excluded.has(index));
+    return true;
+}
+document.getElementById("resume-review-continue").addEventListener("click", () => document.getElementById("resume-review").close("continue"));
+document.getElementById("resume-review-cancel").addEventListener("click", () => document.getElementById("resume-review").close("cancel"));
+
 syncSubmitButton.addEventListener("click", async () => {
     // Build an object where each checkbox id maps to its checked state.
     const syncOptions = Array.from(
@@ -626,6 +670,10 @@ syncSubmitButton.addEventListener("click", async () => {
         }
         collectedData["hidden-dropped"] = rows;
     }
+    syncSubmitButton.disabled = true;
+    try {
+        if (!await reviewResumePoints(collectedData, syncOptions)) return;
+    } finally { syncSubmitButton.disabled = false; }
     const syncJson = JSON.stringify(migrationPayload(filterSyncOptions(syncOptions))); // Filter the lists based on the selected checkboxes before sending to the server
 
     syncSubmitButton.disabled = true;
@@ -691,34 +739,45 @@ function mark_form_as_hidden() {
     }
 }
 
-// Check if the user is authenticated
-fetch("/auth/status")
-    .then((response) => response.json())
-    .then((data) => {
-        const pmdbStatusDot = document.querySelector(".pmdb-status");
-        const pmdbStatusText = document.querySelector(
-            ".pmdb-status + .status-text",
-        );
-        const traktStatusText = document.querySelector(
-            ".trakt-status + .status-text",
-        );
-
-        if (data.pmdb) {
-            pmdbStatusDot.classList.remove("status-red");
-            pmdbStatusDot.classList.add("status-green");
-            pmdbStatusText.innerText = "PublicMetaDb (Connected)";
-            document.getElementById("pmdb-logout").hidden = false;
-        } else {
-            pmdbStatusDot.classList.remove("status-green");
-            pmdbStatusDot.classList.add("status-red");
-            pmdbStatusText.innerText = "PublicMetaDb (Not Logged In)";
-
-            mark_form_as_hidden();
-        }
-    })
-    .catch((error) => {
-        console.error("Error checking PMDB authentication status:", error);
-    });
+let sessionStatusKnown = false;
+let sessionDeadline = 0;
+let sessionHasKey = false;
+function renderSessionStatus() {
+    if (!sessionStatusKnown) return;
+    const remaining = Math.max(0, Math.ceil((sessionDeadline - Date.now()) / 60000));
+    document.getElementById("session-status").textContent = remaining ?
+        `${sessionHasKey ? "Connected" : "Results-only session; session key removed"}. Session expires in about ${remaining} minute(s). A migration can run for up to 6 hours; stopping waits for any in-flight request.` :
+        "No active session. Connect PMDB to start a migration or reconnect to its results.";
+}
+async function refreshSessionStatus() {
+    try {
+        const response = await fetch("/auth/status");
+        if (!response.ok) throw new Error("Status unavailable");
+        const data = await response.json();
+        sessionStatusKnown = true;
+        sessionDeadline = Date.now() + data.expires_in * 1000;
+        sessionHasKey = data.pmdb;
+        const dot = document.querySelector(".pmdb-status");
+        dot.classList.toggle("status-green", !!data.pmdb);
+        dot.classList.toggle("status-red", !data.pmdb);
+        document.querySelector(".pmdb-status + .status-text").textContent = data.pmdb ? "PublicMetaDb (Connected)" : data.can_view_results ? "PublicMetaDb (Results only — reconnect to migrate)" : "PublicMetaDb (Not Logged In)";
+        document.getElementById("pmdb-logout").hidden = !data.can_view_results;
+        document.getElementById("stop-migration").hidden = !data.running_jobs?.length;
+        if (!data.pmdb) mark_form_as_hidden();
+        renderSessionStatus();
+    } catch {
+        sessionStatusKnown = false;
+        document.getElementById("session-status").textContent = "Unable to check session status. Please retry.";
+    }
+}
+refreshSessionStatus();
+setInterval(refreshSessionStatus, 30000);
+setInterval(renderSessionStatus, 1000);
+const sessionMessage = sessionStorage.getItem("session_action_message");
+if (sessionMessage) {
+    document.getElementById("session-action-message").textContent = sessionMessage;
+    sessionStorage.removeItem("session_action_message");
+}
 
 // Hide form if Trakt Data File is not uploaded, as it's required for the migration to work.
 const traktFileStatusDot = document.querySelector(".trakt-file-status");
@@ -799,11 +858,30 @@ authSubmit.addEventListener("click", async () => {
     }
 });
 document.getElementById("pmdb-logout").addEventListener("click", async () => {
-    const response = await fetch("/pmdb/logout", {
-        method: "POST", headers: { "X-Requested-With": "TraktMigration" },
-    });
-    if (response.ok) location.reload();
+    try {
+        const response = await fetch("/pmdb/logout", {method: "POST", headers: {"X-Requested-With": "TraktMigration"}});
+        if (!response.ok) throw new Error();
+        const data = await response.json();
+        sessionStorage.setItem("session_action_message", data.running_jobs ?
+            "Disconnected: the session key was removed. Your migration still has its own key until it ends. Reconnect to follow or stop it." :
+            "Disconnected: the session key was removed. Your API key remains valid in PMDB until you revoke it there.");
+        location.reload();
+    } catch { alert("Could not confirm disconnection. Please retry."); }
 });
+document.getElementById("stop-migration").addEventListener("click", async () => {
+    if (!confirm("Stop this migration and remove the session key? A request already sent may still finish. Imported data will remain in PMDB.")) return;
+    const button = document.getElementById("stop-migration");
+    button.disabled = true;
+    try {
+        const response = await fetch("/pmdb/stop-and-disconnect", {method: "POST", headers: {"X-Requested-With": "TraktMigration"}});
+        if (!response.ok) throw new Error();
+        const data = await response.json();
+        document.getElementById("session-action-message").textContent = data.message + " Session key removed; results-only access remains until session expiry. The worker releases its copy when it stops.";
+        await refreshSessionStatus();
+    } catch { alert("Could not confirm the stop request. Reconnect PMDB if your session expired, then retry."); }
+    finally { button.disabled = false; }
+});
+
 document.getElementById("toggle-all").addEventListener("change", (event) => toggle(event.target));
 
 function updateProgressBar(progress) {
@@ -900,7 +978,7 @@ async function finalizeMigration(data) {
         alert("Migration completed successfully. Check the logs for the stage summary.");
     } else {
         localStorage.setItem("migration_retry_options", JSON.stringify(outcome.retryOptions));
-        alert(`Migration did not fully succeed${outcome.failedNames ? ": " + outcome.failedNames : "."} Your export and logs are preserved. Only failed or unrun stages will be selected; review PMDB before manually retrying.`);
+        alert(`${data.type === "critical" ? data.message + " " : ""}Migration did not fully succeed${outcome.failedNames ? ": " + outcome.failedNames : "."} Your export and logs are preserved. Only failed or unrun stages will be selected; review PMDB and reconnect before manually retrying.`);
     }
     return outcome;
 }

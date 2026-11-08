@@ -211,3 +211,24 @@ It runs for main-branch pushes, pull requests and weekly; Dependabot proposes
 weekly dependency and Action updates. Actions are pinned to commit hashes and
 workflow permissions are read-only. Check the workflow result before deployment;
 a scan cannot prove that the application is free of vulnerabilities.
+
+### Migration controls and resume review
+
+Before submitting selected resume stages, review their titles, episode numbers,
+percentages and pause dates. Items also present in watched history are flagged,
+not automatically removed: a pause can represent a rewatch. Unchecked points
+are excluded from this submission; the stored export is unchanged.
+
+Disconnect PMDB invalidates the current session without cancelling a job.
+Stop migration and disconnect removes the key from matching sessions and asks
+that owner's worker to stop. The current session keeps identity-only access to
+results until its original one-hour expiry. On every job end (success, failure,
+cancellation or deadline), matching sessions lose their stored key as well.
+A new migration requires reconnecting PMDB; reading retained results does not.
+
+Workers check cancellation and a six-hour lifetime before outbound requests,
+between stages and at processing checkpoints. This is cooperative: a request
+already sent may complete, and the deadline is not a hard process kill. Existing
+per-request timeouts still apply. Imported changes are not rolled back. Aborted
+jobs are unsuccessful and preserve the local export for manual review/retry.
+The session status displays remaining time and whether only results access remains.

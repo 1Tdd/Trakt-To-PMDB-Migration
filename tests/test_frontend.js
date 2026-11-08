@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'static', 'app.js'), 'utf8');
-const functionNames = ['describeLogEntry', 'exportBasename', 'normaliseExportEntryName', 'matchesListExportEntry',
+const functionNames = ['resumeReviewRows', 'describeLogEntry', 'exportBasename', 'normaliseExportEntryName', 'matchesListExportEntry',
     'migrationStartError', 'migrationPayload', 'filterSyncOptions', 'restoredMigrationProgress', 'migrationOutcome', 'isTerminalMigrationEvent', 'finalizeMigration', 'renderStageResults', 'clearPrivateLocalData', 'setPrivateDataExpiry', 'expirePrivateLocalData'];
 const extracted = functionNames.map(name => {
     const match = source.match(new RegExp('^(?:async )?function ' + name + '\\([^]*?^}', 'm'));
@@ -337,4 +337,22 @@ test('log renderer preserves raw text and treats HTML as text while filtering is
     filter.checked = true;
     ctx.renderMigrationLogs();
     assert.equal(content.children.map(x => x.textContent).join(''), raw.split('\n').slice(1).join('\n'));
+});
+
+
+test('resume preview flags the same watched episode but retains rewatch choices and filters selected types', () => {
+    const ctx = vm.createContext({});
+    vm.runInContext(extracted, ctx);
+    const episode = {type: 'episode', show: {title: 'Example', ids: {tmdb: 12}}, episode: {season: 1, number: 1}, progress: 2.3, paused_at: '2026-10-20T13:27:40Z'};
+    const movie = {type: 'movie', movie: {title: 'Film', ids: {tmdb: 12}}, progress: 40};
+    const data = {'watched-history': [episode], 'watched-playback': [episode, movie]};
+    const rows = ctx.resumeReviewRows(data, {sync_show_resume_points_choice: true});
+    assert.equal(rows.length, 1);
+    assert.match(rows[0].label, /Example S1E1/);
+    assert.match(rows[0].label, /Already watched/);
+    assert.equal(rows[0].index, 0);
+    const films = ctx.resumeReviewRows(data, {sync_movie_resume_points_choice: true});
+    assert.equal(films.length, 1);
+    assert.doesNotMatch(films[0].label, /Already watched/);
+    assert.equal(data['watched-playback'].length, 2);
 });

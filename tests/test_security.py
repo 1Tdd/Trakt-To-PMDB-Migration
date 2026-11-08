@@ -52,14 +52,14 @@ class SecurityTests(unittest.TestCase):
     def test_status_returns_no_key_or_key_prefix(self):
         self.login()
         response = self.client.get("/auth/status")
-        self.assertEqual(response.json(), {"pmdb": True})
+        self.assertTrue(response.json()["pmdb"])
         self.assertNotIn(FAKE_KEY[:15], response.text)
         self.assertEqual(response.headers["cache-control"], "no-store")
 
     def test_old_encrypted_credentials_are_rejected_and_cookie_removed(self):
         self.client.cookies.set("pmdb_auth", "old-encrypted-credential")
         response = self.client.get("/auth/status")
-        self.assertEqual(response.json(), {"pmdb": False})
+        self.assertFalse(response.json()["pmdb"])
         self.assertIn("Max-Age=0", response.headers["set-cookie"])
         response = self.client.post("/migrate", headers=HEADERS, json={"trakt_data": {"user-profile": {"username": "test"}}})
         self.assertEqual(response.status_code, 401)
@@ -70,7 +70,7 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(self.client.post("/pmdb/logout", headers=HEADERS).status_code, 200)
         self.assertIsNone(webserver.sessions.get(token))
         self.client.cookies.set(webserver.session_cookie_name, token)
-        self.assertEqual(self.client.get("/auth/status").json(), {"pmdb": False})
+        self.assertFalse(self.client.get("/auth/status").json()["pmdb"])
 
     def test_new_login_revokes_previous_session(self):
         self.login()
@@ -88,13 +88,13 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(len(store._entries), 0)
         with patch.object(webserver, "sessions", store):
             self.client.cookies.set(webserver.session_cookie_name, token)
-            self.assertEqual(self.client.get("/auth/status").json(), {"pmdb": False})
+            self.assertFalse(self.client.get("/auth/status").json()["pmdb"])
             self.assertEqual(self.client.get("/migrate/unknown/events").status_code, 401)
 
     def test_restart_invalidates_sessions(self):
         self.login()
         webserver.sessions.clear()
-        self.assertEqual(self.client.get("/auth/status").json(), {"pmdb": False})
+        self.assertFalse(self.client.get("/auth/status").json()["pmdb"])
 
     def test_cross_origin_and_missing_custom_header_requests_are_blocked(self):
         for headers in ({"Origin": "https://attacker.test", "X-Requested-With": "TraktMigration"},

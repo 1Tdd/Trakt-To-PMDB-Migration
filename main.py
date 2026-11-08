@@ -2,6 +2,7 @@ import datetime
 import math
 import queue
 from credentials import ProtectedHeaders
+from job_control import checkpoint
 
 import requests
 from dotenv import load_dotenv
@@ -25,6 +26,7 @@ class BoundedSession(requests.Session):
     """Bound every API operation; writes are deliberately never retried."""
 
     def request(self, method, url, **kwargs):
+        checkpoint()
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = REQUEST_TIMEOUT
         return super().request(method, url, **kwargs)
@@ -49,6 +51,7 @@ class SyncContext:
         return (self.trakt_profile or {}).get("username", "")
     
 def log(message: str, ctx: SyncContext = None, level: str = "info") -> None:
+    checkpoint()
     event_queue = ctx.event_queue if ctx else None
     username = ctx.username if ctx and ctx.username else "SYSTEM"
     sensitive_values = [os.getenv(name) for name in ("pmdb_api_key", "trakt_client", "trakt_secret", "cookie_encryption_key")]
@@ -81,6 +84,7 @@ def log(message: str, ctx: SyncContext = None, level: str = "info") -> None:
 
 def report_item_progress(ctx: SyncContext, completed: int, total: int, message: str) -> None:
     """Publish at most about 100 safe updates per loop, without per-item payloads."""
+    checkpoint()
     if not ctx.event_queue or total <= 0:
         return
     stride = max(1, math.ceil(total / 100))

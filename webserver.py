@@ -23,6 +23,7 @@ import time
 from collections import OrderedDict, deque
 from requests import RequestException
 from process_security import harden_process
+from job_control import JobControl, MigrationStopped, bind, checkpoint, MAX_JOB_SECONDS
 from resource_limits import RequestLimits, RateBudget, MAX_ACTIVE_JOBS
 
 # Define SIGTERM handler
@@ -195,9 +196,10 @@ def get_completed_job(job_id: str) -> dict | None:
 def finish_job(job_id: str, terminal_event: dict) -> None:
     """Release credential-bearing job state, retaining only a bounded safe summary."""
     global running_jobs
-    with jobs_lock:
+    with job_start_lock, jobs_lock:
         job = next((item for item in running_jobs if item["job_id"] == job_id), None)
         if job is not None:
+            sessions.forget_owner_key(job["owner_digest"])
             completed_jobs[job_id] = {
                 "owner_digest": job["owner_digest"],
                 "terminal_event": terminal_event,
@@ -213,7 +215,7 @@ def add_job(job_id: str, event_queue: queue.Queue, pmdb_api_key: str) -> None:
     global running_jobs
 
     with jobs_lock:
-        running_jobs.append({"job_id": job_id, "event_queue": event_queue, "owner_digest": job_owner_digest(pmdb_api_key)})
+        running_jobs.append({"job_id": job_id, "event_queue": event_queue, "owner_digest": job_owner_digest(pmdb_api_key), "control": JobControl()})
     
 def search_running_jobs(pmdb_api_key: str) -> list:
     global running_jobs
@@ -314,21 +316,49 @@ def authenticate_pmdb_user(request: Request, response: Response, Authorization: 
 
 @app.get("/auth/status")
 def get_authentication_status(request: Request, response: Response) -> dict:
-    logged_in = sessions.owner(request.cookies.get(session_cookie_name)) is not None
+    token = request.cookies.get(session_cookie_name)
+    session_status = sessions.status(token)
+    owner = sessions.owner(token)
+    with jobs_lock:
+        session_status["running_jobs"] = [job["job_id"] for job in running_jobs if owner and hmac.compare_digest(owner, job["owner_digest"])]
+    session_status["max_job_seconds"] = MAX_JOB_SECONDS
     # Old encrypted credential cookies are deliberately never decoded or accepted.
     if "pmdb_auth" in request.cookies:
         response.delete_cookie("pmdb_auth", path="/", secure=secure_cookies, httponly=True, samesite="strict")
-    return {"pmdb": logged_in}
+    return session_status
 
 
 @app.post("/pmdb/logout")
 def logout_pmdb(request: Request, response: Response) -> dict:
-    sessions.revoke(request.cookies.get(session_cookie_name))
+    with job_start_lock:
+        owner = sessions.owner(request.cookies.get(session_cookie_name))
+        with jobs_lock:
+            active = sum(1 for job in running_jobs if owner and hmac.compare_digest(owner, job["owner_digest"]))
+        sessions.revoke(request.cookies.get(session_cookie_name))
     delete_auth_cookies(response)
-    return {"success": True}
+    return {"success": True, "running_jobs": active}
+
+
+@app.post("/pmdb/stop-and-disconnect")
+def stop_and_disconnect(request: Request, response: Response):
+    with job_start_lock:
+        owner = sessions.owner(request.cookies.get(session_cookie_name))
+        if owner is None:
+            raise HTTPException(status_code=401, detail="Reconnect PMDB to stop your migration")
+        with jobs_lock:
+            active = [job for job in running_jobs if hmac.compare_digest(owner, job["owner_digest"])]
+            for job in active:
+                job["control"].cancelled.set()
+        sessions.forget_owner_key(owner)
+        # Retain only this session's read access so cancellation can be observed.
+    return {"success": True, "stopping_jobs": len(active),
+            "message": "Stop requested. An in-flight request may still finish. Previously imported data remains in PMDB."}
+
 
 
 def migrate_data(sync_context: dict, sync_options: dict, event_queue: queue.Queue, job_id: str) -> None:
+    job = get_running_job(job_id)
+    bind(job["control"] if job else JobControl())
     stages = [
         ("watchlist", "sync_watchlist_choice", "watchlist", lambda: sync_watchlist(sync_context), "lists-watchlist"),
         ("lists", "sync_lists_choice", "lists", lambda: sync_lists(sync_context), "lists-lists"),
@@ -344,6 +374,7 @@ def migrate_data(sync_context: dict, sync_options: dict, event_queue: queue.Queu
     try:
         for step, (stage_id, option, label, execute, release_key) in enumerate(stages, 1):
             current_stage = {"id": stage_id, "option": option, "name": label, "step": step}
+            checkpoint()
             sync_context.migration_step = step
             sync_context.migration_stage = label
             stage_status = "skipped"
@@ -362,23 +393,24 @@ def migrate_data(sync_context: dict, sync_options: dict, event_queue: queue.Queu
             enqueue_event(event_queue, {"type": "progress", "message": message, "step": step,
                                        "stage": label, "status": stage_status, "steps": list(results),
                                        "progress": round(step / len(stages) * 100)})
+        checkpoint()
         failed_steps = [item["option"] for item in results if item["status"] == "failed"]
         terminal_event = {"type": "complete", "success": not failed_steps,
                           "message": "Migration complete" if not failed_steps else "Migration finished with failed stages. Review the summary before retrying.",
                           "step": len(stages), "progress": 100, "steps": results, "failed_steps": failed_steps}
         enqueue_event(event_queue, terminal_event)
-    except Exception:
+    except Exception as exc:
         # Exception text and tracebacks may contain upstream credentials or request data.
         print("Migration failed; sensitive exception details suppressed.")
         if current_stage:
             results = [item for item in results if item["step"] != current_stage["step"]]
-            results.append({**current_stage, "status": "failed"})
+            results.append({**current_stage, "status": "failed" if sync_options.get(current_stage["option"]) else "skipped"})
         for step, (stage_id, option, label, _, _) in enumerate(stages, 1):
             if step > len(results):
                 results.append({"id": stage_id, "option": option, "name": label, "step": step,
                                 "status": "not-run" if sync_options.get(option) else "skipped"})
         terminal_event = {"type": "critical", "success": False,
-                          "message": "Migration aborted. Review the completed stages and PMDB before retrying.",
+                          "message": (str(exc) + " Review PMDB before retrying; in-flight writes may have completed.") if isinstance(exc, MigrationStopped) else "Migration aborted. Review the completed stages and PMDB before retrying.",
                           "steps": results,
                           "failed_steps": [item["option"] for item in results if item["status"] in {"failed", "not-run"}]}
         enqueue_event(event_queue, terminal_event)
@@ -388,6 +420,7 @@ def migrate_data(sync_context: dict, sync_options: dict, event_queue: queue.Queu
         else:
             remove_job(job_id)
         release_job_memory(sync_context)
+        bind(None)
 
 
 def create_sync_job(sync_context: dict, sync_options: dict, event_queue: queue.Queue) -> tuple[str, queue.Queue, threading.Thread]:
@@ -425,6 +458,9 @@ def request_data_migration(sync_options: sync_options, response: Response, reque
 
     sync_options.trakt_data.pop("user-profile", None)  # Older clients may still send a profile.
     with job_start_lock:
+        pmdb_api_key = session_key(request)
+        if not pmdb_api_key:
+            raise HTTPException(status_code=401, detail="Reconnect PMDB to start another migration")
         return start_data_migration(sync_options, response, pmdb_api_key)
 
 
@@ -462,13 +498,13 @@ def start_data_migration(sync_options: sync_options, response: Response, pmdb_ap
             release_job_memory(sync_context)
         raise HTTPException(status_code=500, detail="Failed to start migration job")
 
-def stream_sync_job(job_id: str, pmdb_api_key: str, request: Request) -> StreamingResponse:
+def stream_sync_job(job_id: str, pmdb_api_key: str, request: Request, session_owner=None) -> StreamingResponse:
     job = get_running_job(job_id)
     completed = get_completed_job(job_id) if job is None else None
     if job is None and completed is None:
         raise HTTPException(status_code=404, detail="Job not found")
     owner_digest = job["owner_digest"] if job else completed["owner_digest"]
-    if not hmac.compare_digest(owner_digest, job_owner_digest(pmdb_api_key)):
+    if not hmac.compare_digest(owner_digest, session_owner or job_owner_digest(pmdb_api_key)):
         raise HTTPException(status_code=403, detail="Forbidden: You do not have access to this job's events")
 
     # The long-lived generator retains only digests and the opaque session cookie.
@@ -528,10 +564,10 @@ def stream_sync_job(job_id: str, pmdb_api_key: str, request: Request) -> Streami
 
 @app.get("/migrate/{job_id}/events")
 def migrate_job_events(job_id: str, request: Request) -> StreamingResponse:
-    pmdb_api_key = session_key(request)
-    if not pmdb_api_key:
+    owner = sessions.owner(request.cookies.get(session_cookie_name))
+    if not owner:
         raise HTTPException(status_code=401, detail="Not authenticated with PMDB")
-    return stream_sync_job(job_id, pmdb_api_key, request)
+    return stream_sync_job(job_id, None, request, session_owner=owner)
 
 # This mounts the "static" directory to serve static files (like the callback HTML page) at the root URL.
 # `html=True` makes `/` resolve to `static/index.html` automatically.
